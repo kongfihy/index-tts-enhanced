@@ -102,6 +102,11 @@ def configure_huggingface_environment(
     environ["INDEXTTS_HF_HUB_CACHE"] = str(primary)
     environ["HF_HUB_CACHE"] = str(primary)
     environ.setdefault("HF_HOME", str(primary.parent))
+    if offline_mode(environ):
+        # Protect direct third-party from_pretrained/hf_hub_download calls too,
+        # not only calls routed through load_pretrained_offline_first().
+        environ["HF_HUB_OFFLINE"] = "1"
+        environ["TRANSFORMERS_OFFLINE"] = "1"
     return primary
 
 

@@ -52,6 +52,21 @@ class HuggingFaceCacheTests(unittest.TestCase):
             self.assertEqual(environment["HF_HUB_CACHE"], str(cache))
             self.assertEqual(environment["HF_HOME"], str(cache.parent))
 
+    def test_configure_propagates_offline_mode_to_huggingface_libraries(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            environment = {"INDEXTTS_OFFLINE": "1"}
+
+            configure_huggingface_environment(
+                project_root=root / "repo",
+                environ=environment,
+                home=root / "home",
+                platform="darwin",
+            )
+
+            self.assertEqual(environment["HF_HUB_OFFLINE"], "1")
+            self.assertEqual(environment["TRANSFORMERS_OFFLINE"], "1")
+
     def test_loader_uses_second_local_cache_without_network(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
