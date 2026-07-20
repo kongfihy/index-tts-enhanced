@@ -1,6 +1,19 @@
 import os
+from pathlib import Path
 
-os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
+def _configure_hf_hub_cache():
+    if os.environ.get("HF_HUB_CACHE"):
+        return
+
+    repo_root = Path(__file__).resolve().parent.parent
+    project_cache = repo_root / "checkpoints" / "hf_cache"
+    user_cache = Path.home() / ".cache" / "huggingface" / "hub"
+
+    cache_dir = user_cache if user_cache.exists() else project_cache
+    os.environ["HF_HUB_CACHE"] = str(cache_dir)
+
+
+_configure_hf_hub_cache()
 import time
 from subprocess import CalledProcessError
 from typing import Dict, List

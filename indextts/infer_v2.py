@@ -1,7 +1,17 @@
+import gc
 import os
+from pathlib import Path
 from subprocess import CalledProcessError
 
-os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
+from indextts.utils.hf_cache import (
+    configure_huggingface_environment,
+    download_file_offline_first,
+    load_pretrained_offline_first,
+)
+
+configure_huggingface_environment(
+    project_root=Path(__file__).resolve().parent.parent,
+)
 import json
 import re
 import time
@@ -21,6 +31,8 @@ from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.maskgct_utils import build_semantic_model, build_semantic_codec
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.front import TextNormalizer, TextTokenizer
+from indextts.utils.audio_output import describe_output_stats, finalize_waveform
+from indextts.utils.randomness import apply_inference_seed
 
 from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
 from indextts.s2mel.modules.bigvgan import bigvgan
@@ -71,6 +83,16 @@ class IndexTTS2:
             self.use_cuda_kernel = False
             print(">> Be patient, it may take a while to run in CPU mode.")
 
+        # MPS uses unified system memory. A runaway allocator/graph cache can otherwise
+        # consume hundreds of GB on large-memory Macs before the OS pushes back.
+        if "mps" in str(self.device):
+            limit_gb = float(os.environ.get("INDEXTTS_MPS_MEMORY_LIMIT_GB", "64"))
+            if limit_gb > 0 and hasattr(torch.mps, "set_per_process_memory_fraction"):
+                recommended = torch.mps.recommended_max_memory()
+                fraction = min(1.0, (limit_gb * 1024 ** 3) / recommended)
+                torch.mps.set_per_process_memory_fraction(fraction)
+                print(f">> MPS memory safety limit: {min(limit_gb, recommended / 1024 ** 3):.1f} GB")
+
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
         self.dtype = torch.float16 if self.use_fp16 else None
@@ -108,7 +130,11 @@ class IndexTTS2:
                 print(">> Failed to load custom CUDA kernel for BigVGAN. Falling back to torch.")
                 self.use_cuda_kernel = False
 
-        self.extract_features = SeamlessM4TFeatureExtractor.from_pretrained("facebook/w2v-bert-2.0")
+        self.extract_features = load_pretrained_offline_first(
+            SeamlessM4TFeatureExtractor.from_pretrained,
+            "facebook/w2v-bert-2.0",
+            component_name="W2V-BERT feature extractor",
+        )
         self.semantic_model, self.semantic_mean, self.semantic_std = build_semantic_model(
             os.path.join(self.model_dir, self.cfg.w2v_stat))
         self.semantic_model = self.semantic_model.to(self.device)
@@ -117,7 +143,12 @@ class IndexTTS2:
         self.semantic_std = self.semantic_std.to(self.device)
 
         semantic_codec = build_semantic_codec(self.cfg.semantic_codec)
-        semantic_code_ckpt = hf_hub_download("amphion/MaskGCT", filename="semantic_codec/model.safetensors")
+        semantic_code_ckpt = download_file_offline_first(
+            hf_hub_download,
+            "amphion/MaskGCT",
+            filename="semantic_codec/model.safetensors",
+            component_name="MaskGCT semantic codec",
+        )
         safetensors.torch.load_model(semantic_codec, semantic_code_ckpt)
         self.semantic_codec = semantic_codec.to(self.device)
         self.semantic_codec.eval()
@@ -139,8 +170,11 @@ class IndexTTS2:
         print(">> s2mel weights restored from:", s2mel_path)
 
         # load campplus_model
-        campplus_ckpt_path = hf_hub_download(
-            "funasr/campplus", filename="campplus_cn_common.bin"
+        campplus_ckpt_path = download_file_offline_first(
+            hf_hub_download,
+            "funasr/campplus",
+            filename="campplus_cn_common.bin",
+            component_name="CampPlus speaker model",
         )
         campplus_model = CAMPPlus(feat_dim=80, embedding_size=192)
         campplus_model.load_state_dict(torch.load(campplus_ckpt_path, map_location="cpu"))
@@ -149,7 +183,12 @@ class IndexTTS2:
         print(">> campplus_model weights restored from:", campplus_ckpt_path)
 
         bigvgan_name = self.cfg.vocoder.name
-        self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=True if self.use_cuda_kernel else False)
+        self.bigvgan = load_pretrained_offline_first(
+            bigvgan.BigVGAN.from_pretrained,
+            bigvgan_name,
+            component_name="BigVGAN vocoder",
+            use_cuda_kernel=True if self.use_cuda_kernel else False,
+        )
         self.bigvgan = self.bigvgan.to(self.device)
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
@@ -292,12 +331,61 @@ class IndexTTS2:
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
 
+    def _memory_snapshot(self):
+        if "mps" not in str(self.device) or not hasattr(torch.mps, "driver_allocated_memory"):
+            return None
+        return (
+            torch.mps.current_allocated_memory() / 1024 ** 3,
+            torch.mps.driver_allocated_memory() / 1024 ** 3,
+        )
+
+    def release_runtime_memory(self, synchronize=True, collect_python=True):
+        # Transformers keeps the latest conditioning embedding on the model object.
+        # It is request-local and must not survive after generation.
+        inference_model = getattr(self.gpt, "inference_model", None)
+        if inference_model is not None:
+            inference_model.cached_mel_emb = None
+
+        before = self._memory_snapshot()
+        if collect_python:
+            gc.collect()
+
+        try:
+            if "cuda" in str(self.device):
+                if synchronize:
+                    torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            elif "mps" in str(self.device):
+                if synchronize:
+                    torch.mps.synchronize()
+                torch.mps.empty_cache()
+        except Exception as exc:
+            if os.environ.get("INDEXTTS_MEMORY_DEBUG") == "1":
+                print(f">> memory cleanup warning: {exc}")
+
+        if os.environ.get("INDEXTTS_MEMORY_DEBUG") == "1":
+            after = self._memory_snapshot()
+            if before is not None and after is not None:
+                print(
+                    ">> MPS memory cleanup: "
+                    f"tensor {before[0]:.2f}->{after[0]:.2f} GB, "
+                    f"driver {before[1]:.2f}->{after[1]:.2f} GB"
+                )
+
+    @torch.inference_mode()
+    def infer(self, *args, **kwargs):
+        try:
+            return self._infer_impl(*args, **kwargs)
+        finally:
+            self.release_runtime_memory(synchronize=True, collect_python=True)
+
     # 原始推理模式
-    def infer(self, spk_audio_prompt, text, output_path,
+    def _infer_impl(self, spk_audio_prompt, text, output_path,
               emo_audio_prompt=None, emo_alpha=1.0,
               emo_vector=None,
               use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, **generation_kwargs):
+              verbose=False, max_text_tokens_per_segment=120,
+              normalize_output_peak=False, seed=None, **generation_kwargs):
         print(">> start inference...")
         self._set_gr_progress(0, "start inference...")
         if verbose:
@@ -306,6 +394,9 @@ class IndexTTS2:
                   f"emo_vector:{emo_vector}, use_emo_text:{use_emo_text}, "
                   f"emo_text:{emo_text}")
         start_time = time.perf_counter()
+        if seed is not None:
+            seed = apply_inference_seed(seed)
+            print(f">> inference seed: {seed}")
 
         if use_emo_text:
             emo_audio_prompt = None
@@ -455,7 +546,7 @@ class IndexTTS2:
                         cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_vec=emovec,
-                        do_sample=True,
+                        do_sample=do_sample,
                         top_p=top_p,
                         top_k=top_k,
                         temperature=temperature,
@@ -547,11 +638,24 @@ class IndexTTS2:
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
 
-                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+                # Keep vocoder output as float until every segment has been
+                # assembled. Per-segment int16 clamping permanently flattens peaks
+                # and can create audible clipping at different levels per segment.
+                wav = wav.float()
                 if verbose:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
                 # wavs.append(wav[:, :-512])
-                wavs.append(wav.cpu())  # to cpu before saving
+                wavs.append(wav.detach().cpu())  # to CPU before final processing
+
+                # Drop segment-local GPU tensors before the next variable-length
+                # segment. This prevents the MPS allocator from retaining every
+                # segment's peak allocation.
+                inference_model = getattr(self.gpt, "inference_model", None)
+                if inference_model is not None:
+                    inference_model.cached_mel_emb = None
+                del wav, vc_target, cat_condition, cond, S_infer, latent
+                del codes, code_lens, speech_conditioning_latent, text_tokens
+                self.release_runtime_memory(synchronize=False, collect_python=False)
         end_time = time.perf_counter()
         self._set_gr_progress(0.9, "save audio...")
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
@@ -565,8 +669,16 @@ class IndexTTS2:
         print(f">> Generated audio length: {wav_length:.2f} seconds")
         print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
 
-        # save audio
-        wav = wav.cpu()  # to cpu
+        # Finalize the complete waveform once, so every segment uses the same
+        # gain and peaks are reduced linearly instead of hard-clipped.
+        wav = wav.cpu().float()
+        wav_data, output_stats = finalize_waveform(
+            wav.numpy(),
+            target_peak_dbfs=-1.0,
+            normalize_peak=normalize_output_peak,
+            max_amplification_db=6.0,
+        )
+        print(">> audio output:", describe_output_stats(output_stats))
         if output_path:
             # 直接保存音频到指定路径中
             if os.path.isfile(output_path):
@@ -574,14 +686,12 @@ class IndexTTS2:
                 print(">> remove old wav file:", output_path)
             if os.path.dirname(output_path) != "":
                 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+            torchaudio.save(output_path, torch.from_numpy(wav_data), sampling_rate)
             print(">> wav file saved to:", output_path)
             return output_path
         else:
             # 返回以符合Gradio的格式要求
-            wav_data = wav.type(torch.int16)
-            wav_data = wav_data.numpy().T
-            return (sampling_rate, wav_data)
+            return (sampling_rate, wav_data.T)
 
 
 def find_most_similar_cosine(query_vector, matrix):
@@ -668,7 +778,10 @@ class QwenEmotion:
         # conduct text completion
         generated_ids = self.model.generate(
             **model_inputs,
-            max_new_tokens=32768,
+            # The result is a tiny JSON object. 32768 allowed an unnecessarily
+            # large KV/cache growth on MPS when EOS detection failed.
+            max_new_tokens=256,
+            do_sample=False,
             pad_token_id=self.tokenizer.eos_token_id
         )
         output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()

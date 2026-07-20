@@ -29,3 +29,44 @@ desktop.ini
 /checkpoints/*
 !/checkpoints/*.yaml
 /outputs/
+
+# Local runtime and macOS app build artifacts.
+/prompts/
+/apps/macos/IndexTTSMenuBar/.build/
+/apps/macos/IndexTTSMenuBar/dist/
+/apps/macos/IndexTTSMenuBar/.swiftpm/
+
+# Private local handoff and runtime records.
+/.codex-local/
+
+# User-provided or generated media. Official files already tracked by Git are unaffected.
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+*.ogg
+*.opus
+*.mp4
+*.mov
+*.mkv
+
+# Local databases, logs and process state.
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+*.log.*
+*.pid
+
+# Local credentials and signing material.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx

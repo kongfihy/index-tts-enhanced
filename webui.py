@@ -1,8 +1,24 @@
-import json
 import os
+import shutil
 import sys
-import threading
-import time
+from pathlib import Path
+
+# Hugging Face reads its cache configuration during import.  Configure it
+# before importing Gradio, Transformers or any other third-party dependency.
+from indextts.utils.hf_cache import configure_huggingface_environment
+
+HF_HUB_CACHE = configure_huggingface_environment(
+    project_root=Path(__file__).resolve().parent,
+)
+
+# Keep other generated runtime caches in writable temp dirs on macOS.
+os.environ.setdefault('MPLCONFIGDIR', '/private/tmp/indextts-mpl')
+os.environ.setdefault('XDG_CACHE_HOME', '/private/tmp/indextts-cache')
+os.environ.setdefault('NUMBA_CACHE_DIR', '/private/tmp/indextts-numba')
+Path(os.environ['MPLCONFIGDIR']).mkdir(parents=True, exist_ok=True)
+Path(os.environ['XDG_CACHE_HOME']).mkdir(parents=True, exist_ok=True)
+Path(os.environ['NUMBA_CACHE_DIR']).mkdir(parents=True, exist_ok=True)
+print(f">> Hugging Face primary cache: {HF_HUB_CACHE}")
 
 import warnings
 
@@ -48,9 +64,39 @@ for file in [
 
 import gradio as gr
 from indextts.infer_v2 import IndexTTS2
+from indextts_dubbing.candidates import (
+    build_candidate_plan,
+    candidate_directory,
+    candidate_output_paths,
+    read_candidate_manifest,
+    write_candidate_manifest,
+)
 from tools.i18n.i18n import I18nAuto
+from indextts_task_center import (
+    JobAlreadyRunning,
+    JobCancelled,
+    JobManager,
+    JobProgress,
+    TASK_CENTER_PORT,
+    start_task_center_server,
+    task_center_host_for_webui,
+)
+from indextts_webui_helpers import (
+    generation_readiness,
+    generation_request_key,
+    normalize_advanced_generation_args,
+    normalize_choice_index,
+    prepare_reference_audio_file,
+    reference_audio_quality_message,
+    validate_audio_file,
+    validate_generation_inputs,
+)
 
-i18n = I18nAuto(language="Auto")
+# This workspace is used as a local Chinese dubbing tool. Auto locale detection
+# can return an unsupported macOS locale and silently fall back to English.
+i18n = I18nAuto(language="zh_CN")
+job_manager = JobManager(output_root=Path("outputs/tasks"))
+start_task_center_server(job_manager, host=task_center_host_for_webui(cmd_args.host))
 MODE = 'local'
 tts = IndexTTS2(model_dir=cmd_args.model_dir,
                 cfg_path=os.path.join(cmd_args.model_dir, "config.yaml"),
@@ -58,11 +104,6 @@ tts = IndexTTS2(model_dir=cmd_args.model_dir,
                 use_deepspeed=cmd_args.use_deepspeed,
                 use_cuda_kernel=cmd_args.cuda_kernel,
                 )
-# 支持的语言列表
-LANGUAGES = {
-    "中文": "zh_CN",
-    "English": "en_US"
-}
 EMO_CHOICES = [i18n("与音色参考音频相同"),
                 i18n("使用情感参考音频"),
                 i18n("使用情感向量控制"),
@@ -70,136 +111,810 @@ EMO_CHOICES = [i18n("与音色参考音频相同"),
 os.makedirs("outputs/tasks",exist_ok=True)
 os.makedirs("prompts",exist_ok=True)
 
-MAX_LENGTH_TO_USE_SPEED = 70
-with open("examples/cases.jsonl", "r", encoding="utf-8") as f:
-    example_cases = []
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        example = json.loads(line)
-        if example.get("emo_audio",None):
-            emo_audio_path = os.path.join("examples",example["emo_audio"])
-        else:
-            emo_audio_path = None
-        example_cases.append([os.path.join("examples", example.get("prompt_audio", "sample_prompt.wav")),
-                              EMO_CHOICES[example.get("emo_mode",0)],
-                              example.get("text"),
-                             emo_audio_path,
-                             example.get("emo_weight",1.0),
-                             example.get("emo_text",""),
-                             example.get("emo_vec_1",0),
-                             example.get("emo_vec_2",0),
-                             example.get("emo_vec_3",0),
-                             example.get("emo_vec_4",0),
-                             example.get("emo_vec_5",0),
-                             example.get("emo_vec_6",0),
-                             example.get("emo_vec_7",0),
-                             example.get("emo_vec_8",0)]
-                             )
+def register_job(project_name, text, prompt,
+                 emo_control_method, emo_ref_path, emo_weight,
+                 vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+                 emo_text, emo_random, max_text_tokens_per_segment,
+                 seed_value, candidate_count, *advanced_args):
+    try:
+        clean_text = validate_generation_inputs(prompt, text)
+        emotion_method = normalize_choice_index(emo_control_method, EMO_CHOICES)
+        vectors = [float(value or 0.0) for value in (vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8)]
+        clean_emo_weight = float(emo_weight)
+        clean_segment_limit = int(max_text_tokens_per_segment)
+        candidate_plan = build_candidate_plan(seed_value, candidate_count)
+        clean_advanced_args = normalize_advanced_generation_args(advanced_args)
+        if emotion_method == 1:
+            emo_ref_path = validate_audio_file(emo_ref_path, "情感参考音频")
+        if emotion_method == 2 and sum(vectors) > 1.5:
+            raise ValueError(i18n("情感向量之和不能超过1.5，请调整后重试。"))
+    except (TypeError, ValueError) as exc:
+        raise gr.Error(str(exc))
 
-
-def gen_single(emo_control_method,prompt, text,
-               emo_ref_path, emo_weight,
-               vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
-               emo_text,emo_random,
-               max_text_tokens_per_segment=120,
-                *args, progress=gr.Progress()):
-    output_path = None
-    if not output_path:
-        output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
-    # set gradio progress
-    tts.gr_progress = progress
-    do_sample, top_p, top_k, temperature, \
-        length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
-    kwargs = {
-        "do_sample": bool(do_sample),
-        "top_p": float(top_p),
-        "top_k": int(top_k) if int(top_k) > 0 else None,
-        "temperature": float(temperature),
-        "length_penalty": float(length_penalty),
-        "num_beams": num_beams,
-        "repetition_penalty": float(repetition_penalty),
-        "max_mel_tokens": int(max_mel_tokens),
-        # "typical_sampling": bool(typical_sampling),
-        # "typical_mass": float(typical_mass),
+    request_snapshot = {
+        "prompt": str(prompt),
+        "text": clean_text,
+        "emo_control_method": emotion_method,
+        "emo_ref_path": str(emo_ref_path) if emo_ref_path else None,
+        "emo_weight": clean_emo_weight,
+        "vectors": vectors,
+        "emo_text": (emo_text or "").strip() or None,
+        "emo_random": bool(emo_random),
+        "max_text_tokens_per_segment": clean_segment_limit,
+        "seed": candidate_plan.base_seed,
+        "candidate_count": candidate_plan.count,
+        "candidate_seeds": list(candidate_plan.seeds),
+        "advanced_args": clean_advanced_args,
     }
-    if type(emo_control_method) is not int:
-        emo_control_method = emo_control_method.value
-    if emo_control_method == 0:
-        emo_ref_path = None
-        emo_weight = 1.0
-    if emo_control_method == 1:
-        emo_weight = emo_weight
-    if emo_control_method == 2:
-        vec = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
-        vec_sum = sum([vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8])
-        if vec_sum > 1.5:
-            gr.Warning(i18n("情感向量之和不能超过1.5，请调整后重试。"))
-            return
-    else:
-        vec = None
+    summary = clean_text.replace("\n", " ")
+    job_id = job_manager.create_job(
+        project_name=project_name,
+        job_type="tts",
+        input_summary=summary,
+        parameters={
+            "prompt_audio": os.path.basename(str(prompt)),
+            "emotion_method": emotion_method,
+            "request_key": generation_request_key(request_snapshot),
+            "seed": candidate_plan.base_seed,
+            "candidate_count": candidate_plan.count,
+        },
+        seed=candidate_plan.base_seed,
+    )
+    return (
+        job_id,
+        request_snapshot,
+        gr.update(interactive=False, value="正在排队…"),
+        gr.update(interactive=False),
+        "任务已加入队列，开始后可以在任务中心查看进度。",
+        True,
+    )
 
-    if emo_text == "":
-        # erase empty emotion descriptions; `infer()` will then automatically use the main prompt
-        emo_text = None
 
-    print(f"Emo control mode:{emo_control_method},vec:{vec}")
-    output = tts.infer(spk_audio_prompt=prompt, text=text,
-                       output_path=output_path,
-                       emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
-                       emo_vector=vec,
-                       use_emo_text=(emo_control_method==3), emo_text=emo_text,use_random=emo_random,
-                       verbose=cmd_args.verbose,
-                       max_text_tokens_per_segment=int(max_text_tokens_per_segment),
-                       **kwargs)
-    return gr.update(value=output,visible=True)
+def update_submit_state(prompt, text, is_busy=False):
+    if is_busy:
+        return gr.update(interactive=False, value="正在生成…"), "当前任务正在生成，可以继续编辑文本准备下一次提交。"
+    ready, message = generation_readiness(prompt, text)
+    return gr.update(
+        interactive=ready,
+        value="开始生成" if ready else "请完善输入",
+    ), message
 
-def update_prompt_audio():
-    update_button = gr.update(interactive=True)
-    return update_button
 
-with gr.Blocks(title="IndexTTS Demo") as demo:
-    mutex = threading.Lock()
-    gr.HTML('''
-    <h2><center>IndexTTS2: A Breakthrough in Emotionally Expressive and Duration-Controlled Auto-Regressive Zero-Shot Text-to-Speech</h2>
-<p align="center">
-<a href='https://arxiv.org/abs/2506.21619'><img src='https://img.shields.io/badge/ArXiv-2506.21619-red'></a>
-</p>
-    ''')
-    with gr.Tab(i18n("音频生成")):
-        with gr.Row():
-            os.makedirs("prompts",exist_ok=True)
-            prompt_audio = gr.Audio(label=i18n("音色参考音频"),key="prompt_audio",
-                                    sources=["upload","microphone"],type="filepath")
-            prompt_list = os.listdir("prompts")
-            default = ''
-            if prompt_list:
-                default = prompt_list[0]
-            with gr.Column():
-                input_text_single = gr.TextArea(label=i18n("文本"),key="input_text_single", placeholder=i18n("请输入目标文本"), info=f"{i18n('当前模型版本')}{tts.model_version or '1.0'}")
-                gen_button = gr.Button(i18n("生成语音"), key="gen_button",interactive=True)
-            output_audio = gr.Audio(label=i18n("生成结果"), visible=True,key="output_audio")
-        with gr.Accordion(i18n("功能设置")):
-            # 情感控制选项部分
-            with gr.Row():
-                emo_control_method = gr.Radio(
-                    choices=EMO_CHOICES,
-                    type="index",
-                    value=EMO_CHOICES[0],label=i18n("情感控制方式"))
-        # 情感参考音频部分
+def update_reference_state(prompt, text, is_busy=False):
+    submit_update, readiness = update_submit_state(prompt, text, is_busy)
+    return submit_update, readiness, reference_audio_quality_message(prompt)
+
+
+def prepare_prompt_audio(prompt):
+    try:
+        prepared_path, message = prepare_reference_audio_file(prompt)
+    except ValueError as exc:
+        raise gr.Error(str(exc))
+    return gr.update(value=prepared_path), message
+
+
+def restore_action_buttons(prompt, text):
+    ready, _ = generation_readiness(prompt, text)
+    return (
+        gr.update(interactive=ready, value="开始生成" if ready else "请完善输入"),
+        gr.update(interactive=True),
+        False,
+    )
+
+
+def reset_ui_state():
+    return (
+        gr.update(interactive=False, value="请完善输入"),
+        "请先上传参考音频，并填写需要生成的文本。",
+        "等待生成",
+        "输入文本后会在这里预览模型分段。",
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False),
+        False,
+        "上传后会自动检查时长、音量、削波和静音比例。",
+    )
+
+
+def mark_generation_failed():
+    return "生成未完成，请根据页面提示检查输入；任务详情可在任务中心查看。"
+
+
+def candidate_result_updates(paths):
+    clean_paths = [str(path) for path in paths if path]
+    padded = (clean_paths + [None, None, None])[:3]
+    return tuple(
+        gr.update(value=path, visible=bool(path))
+        for path in padded
+    )
+
+
+def gen_single(job_id, request_snapshot, progress=gr.Progress()):
+    output_root = Path("outputs/tasks")
+    try:
+        should_run, existing_output = job_manager.start_job(job_id)
+    except JobCancelled:
+        gr.Warning(i18n("任务已取消"))
+        return gr.update(), gr.update(), gr.update(), "任务已取消"
+    except JobAlreadyRunning as exc:
+        gr.Warning(str(exc))
+        return gr.update(), gr.update(), gr.update(), "相同任务已经在生成，请在任务中心查看进度。"
+    except RuntimeError as exc:
+        raise gr.Error(str(exc))
+
+    if not should_run:
+        restored = [item["path"] for item in read_candidate_manifest(output_root, job_id)]
+        if not restored and existing_output:
+            restored = [existing_output]
+        return (
+            *candidate_result_updates(restored),
+            f"检测到相同任务已经完成，已恢复 {len(restored) or 1} 个生成结果。",
+        )
+
+    candidate_root = candidate_directory(output_root, job_id)
+    try:
+        if not isinstance(request_snapshot, dict) or not request_snapshot:
+            raise ValueError("任务参数快照丢失，请重新提交")
+
+        prompt = request_snapshot["prompt"]
+        clean_text = validate_generation_inputs(prompt, request_snapshot["text"])
+        emotion_method = normalize_choice_index(request_snapshot["emo_control_method"], EMO_CHOICES)
+        emo_ref_path = request_snapshot.get("emo_ref_path")
+        emo_weight = float(request_snapshot.get("emo_weight", 1.0))
+        vectors = [float(value or 0.0) for value in (request_snapshot.get("vectors") or [])]
+        if len(vectors) != 8:
+            raise ValueError("情感向量参数不完整，请重新提交")
+        emo_text = request_snapshot.get("emo_text")
+        emo_random = bool(request_snapshot.get("emo_random", False))
+        max_text_tokens_per_segment = int(request_snapshot.get("max_text_tokens_per_segment", 120))
+        candidate_plan = build_candidate_plan(
+            request_snapshot.get("seed", 0),
+            request_snapshot.get("candidate_count", 1),
+        )
+        saved_candidate_seeds = request_snapshot.get("candidate_seeds") or []
+        if len(saved_candidate_seeds) == candidate_plan.count:
+            candidate_seeds = tuple(int(seed) for seed in saved_candidate_seeds)
+        else:
+            candidate_seeds = candidate_plan.seeds
+        output_paths = candidate_output_paths(output_root, job_id, candidate_seeds)
+        advanced_args = normalize_advanced_generation_args(
+            request_snapshot.get("advanced_args") or []
+        )
+
+        do_sample, top_p, top_k, temperature, \
+            length_penalty, num_beams, repetition_penalty, max_mel_tokens, \
+            normalize_output_peak = advanced_args
+        kwargs = {
+            "do_sample": bool(do_sample),
+            "top_p": float(top_p),
+            "top_k": int(top_k) if int(top_k) > 0 else None,
+            "temperature": float(temperature),
+            "length_penalty": float(length_penalty),
+            "num_beams": int(num_beams),
+            "repetition_penalty": float(repetition_penalty),
+            "max_mel_tokens": int(max_mel_tokens),
+            "normalize_output_peak": bool(normalize_output_peak),
+        }
+        if emotion_method == 0:
+            emo_ref_path = None
+            emo_weight = 1.0
+        elif emotion_method == 1:
+            emo_ref_path = validate_audio_file(emo_ref_path, "情感参考音频")
+
+        if emotion_method == 2:
+            if sum(vectors) > 1.5:
+                raise ValueError(i18n("情感向量之和不能超过1.5，请调整后重试。"))
+            vec = vectors
+        else:
+            vec = None
+
+        shutil.rmtree(candidate_root, ignore_errors=True)
+        candidate_root.mkdir(parents=True, exist_ok=True)
+        generated_paths = []
+        for index, (seed, output_path) in enumerate(zip(candidate_seeds, output_paths)):
+            tts.gr_progress = JobProgress(
+                job_manager,
+                job_id,
+                progress,
+                progress_start=index / candidate_plan.count,
+                progress_span=1.0 / candidate_plan.count,
+                description_prefix=f"候选 {index + 1}/{candidate_plan.count} · ",
+            )
+            output = tts.infer(
+                spk_audio_prompt=prompt,
+                text=clean_text,
+                output_path=str(output_path),
+                emo_audio_prompt=emo_ref_path,
+                emo_alpha=emo_weight,
+                emo_vector=vec,
+                use_emo_text=(emotion_method == 3),
+                emo_text=emo_text,
+                use_random=emo_random,
+                verbose=cmd_args.verbose,
+                max_text_tokens_per_segment=max_text_tokens_per_segment,
+                seed=seed,
+                **kwargs,
+            )
+            generated_paths.append(output)
+
+        write_candidate_manifest(output_root, job_id, generated_paths, candidate_seeds)
+        job_manager.complete_job(job_id, generated_paths)
+        seed_text = "、".join(str(seed) for seed in candidate_seeds)
+        return (
+            *candidate_result_updates(generated_paths),
+            f"生成完成 · {len(generated_paths)} 个候选 · 随机种子 {seed_text}",
+        )
+    except Exception as exc:
+        job_manager.fail_job(job_id, exc)
+        shutil.rmtree(candidate_root, ignore_errors=True)
+        if isinstance(exc, JobCancelled):
+            raise gr.Error(i18n("任务已取消"))
+        raise gr.Error(f"生成失败：{exc}")
+    finally:
+        tts.gr_progress = None
+
+def empty_segments_frame():
+    return pd.DataFrame([], columns=[i18n("序号"), i18n("分句内容"), i18n("Token数")])
+
+
+def on_input_text_change(text, max_text_tokens_per_segment):
+    clean_text = (text or "").strip()
+    if not clean_text:
+        return gr.update(value=empty_segments_frame()), "输入文本后会在这里预览模型分段。"
+
+    try:
+        text_tokens_list = tts.tokenizer.tokenize(clean_text)
+        segments = tts.tokenizer.split_segments(
+            text_tokens_list,
+            max_text_tokens_per_segment=int(max_text_tokens_per_segment),
+        )
+        data = []
+        for index, segment in enumerate(segments, start=1):
+            segment_text = "".join(segment)
+            data.append([index, segment_text, len(segment)])
+        return gr.update(value=data), f"预计分为 {len(data)} 段；这里只做预览，不会修改原文本。"
+    except Exception as exc:
+        print(f">> segment preview warning: {exc}")
+        return (
+            gr.update(value=empty_segments_frame()),
+            "分句预览暂时不可用，但不会影响文本继续编辑。",
+        )
+
+
+def on_method_select(emo_control_method):
+    try:
+        emotion_method = normalize_choice_index(emo_control_method, EMO_CHOICES)
+    except ValueError:
+        emotion_method = 0
+
+    if emotion_method == 1:
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+        )
+    if emotion_method == 2:
+        return (
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(visible=True),
+            gr.update(visible=False),
+        )
+    if emotion_method == 3:
+        return (
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=True),
+        )
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+    )
+
+
+APP_CSS = """
+:root {
+    color-scheme: light dark;
+    --idx-bg: #f6f7fb;
+    --idx-surface: rgba(255, 255, 255, 0.92);
+    --idx-surface-soft: rgba(255, 255, 255, 0.72);
+    --idx-text: #172033;
+    --idx-text-muted: #647084;
+    --idx-border: rgba(99, 112, 138, 0.22);
+    --idx-shadow: 0 18px 48px rgba(15, 23, 42, 0.08);
+    --idx-hero-bg:
+        radial-gradient(circle at top left, rgba(124, 92, 255, 0.22), transparent 34%),
+        linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(234, 248, 246, 0.88));
+    --idx-accent: #6852f5;
+    --idx-accent-soft: rgba(104, 82, 245, 0.12);
+    --idx-green-soft: rgba(72, 200, 178, 0.14);
+    --idx-output-bg: rgba(248, 250, 252, 0.86);
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --idx-bg: #0c111d;
+        --idx-surface: rgba(21, 28, 43, 0.92);
+        --idx-surface-soft: rgba(27, 36, 54, 0.74);
+        --idx-text: #eef3ff;
+        --idx-text-muted: #a8b3c7;
+        --idx-border: rgba(154, 169, 196, 0.2);
+        --idx-shadow: 0 20px 58px rgba(0, 0, 0, 0.36);
+        --idx-hero-bg:
+            radial-gradient(circle at top left, rgba(139, 116, 255, 0.28), transparent 36%),
+            linear-gradient(135deg, rgba(25, 33, 52, 0.98), rgba(13, 55, 64, 0.74));
+        --idx-accent: #9b8cff;
+        --idx-accent-soft: rgba(155, 140, 255, 0.16);
+        --idx-green-soft: rgba(82, 211, 189, 0.13);
+        --idx-output-bg: rgba(14, 21, 34, 0.76);
+    }
+}
+
+html.dark,
+body.dark,
+.dark {
+    --idx-bg: #0c111d;
+    --idx-surface: rgba(21, 28, 43, 0.92);
+    --idx-surface-soft: rgba(27, 36, 54, 0.74);
+    --idx-text: #eef3ff;
+    --idx-text-muted: #a8b3c7;
+    --idx-border: rgba(154, 169, 196, 0.2);
+    --idx-shadow: 0 20px 58px rgba(0, 0, 0, 0.36);
+    --idx-hero-bg:
+        radial-gradient(circle at top left, rgba(139, 116, 255, 0.28), transparent 36%),
+        linear-gradient(135deg, rgba(25, 33, 52, 0.98), rgba(13, 55, 64, 0.74));
+    --idx-accent: #9b8cff;
+    --idx-accent-soft: rgba(155, 140, 255, 0.16);
+    --idx-green-soft: rgba(82, 211, 189, 0.13);
+    --idx-output-bg: rgba(14, 21, 34, 0.76);
+}
+
+body,
+.gradio-container {
+    background: var(--idx-bg) !important;
+}
+body {
+    overflow-x: hidden;
+}
+html {
+    scrollbar-width: thin;
+    scrollbar-color: var(--idx-border) transparent;
+}
+html::-webkit-scrollbar {
+    width: 8px;
+}
+html::-webkit-scrollbar-track {
+    background: transparent;
+}
+html::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background: var(--idx-border);
+    background-clip: content-box;
+}
+.gradio-container {
+    width: min(1480px, calc(100vw - 32px)) !important;
+    max-width: 1480px !important;
+    margin: 0 auto !important;
+    padding: 20px 0 44px !important;
+    color: var(--idx-text) !important;
+}
+.hero-shell {
+    position: relative;
+    overflow: hidden;
+    padding: 28px 30px;
+    margin-bottom: 18px;
+    border: 1px solid var(--idx-border);
+    border-radius: 20px;
+    background: var(--idx-hero-bg);
+    box-shadow: var(--idx-shadow);
+}
+.hero-shell::after {
+    content: "";
+    position: absolute;
+    right: -70px;
+    top: -92px;
+    width: 230px;
+    height: 230px;
+    border-radius: 999px;
+    background: var(--idx-green-soft);
+    filter: blur(4px);
+    pointer-events: none;
+}
+.hero-kicker {
+    position: relative;
+    z-index: 1;
+    margin-bottom: 8px;
+    color: var(--idx-accent);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+}
+.hero-shell h1 {
+    position: relative;
+    z-index: 1;
+    margin: 0;
+    color: var(--idx-text);
+    font-size: clamp(28px, 4vw, 40px);
+    line-height: 1.12;
+}
+.hero-shell p {
+    position: relative;
+    z-index: 1;
+    max-width: 720px;
+    margin: 10px 0 0;
+    color: var(--idx-text-muted);
+    font-size: 15px;
+    line-height: 1.7;
+}
+.workspace-grid {
+    display: grid !important;
+    grid-template-columns: minmax(280px, 0.95fr) minmax(380px, 1.25fr) minmax(300px, 0.9fr);
+    grid-template-areas: "reference content result";
+    gap: 18px !important;
+    align-items: start !important;
+}
+.workspace-grid > * {
+    min-width: 0 !important;
+    width: auto !important;
+}
+.reference-panel {
+    grid-area: reference;
+}
+.content-panel {
+    grid-area: content;
+}
+.result-panel {
+    grid-area: result;
+}
+.panel-card,
+.output-card {
+    min-width: 0 !important;
+    padding: 20px !important;
+    border: 1px solid var(--idx-border) !important;
+    border-radius: 18px !important;
+    background: var(--idx-surface) !important;
+    box-shadow: var(--idx-shadow);
+    backdrop-filter: blur(14px);
+}
+.panel-card h3,
+.output-card h3 {
+    margin-top: 0;
+    color: var(--idx-text);
+}
+.section-note {
+    color: var(--idx-text-muted);
+    font-size: 13px;
+    line-height: 1.6;
+}
+.status-copy {
+    min-height: 24px;
+    color: var(--idx-text-muted);
+    font-size: 13px;
+}
+.gradio-container textarea,
+.gradio-container input,
+.gradio-container .wrap.default,
+.gradio-container .wrap.svelte-1ipelgc,
+.gradio-container .block {
+    border-color: var(--idx-border) !important;
+}
+.gradio-container textarea,
+.gradio-container input {
+    background: var(--idx-surface-soft) !important;
+    color: var(--idx-text) !important;
+}
+#generate-button button {
+    min-height: 46px;
+    font-weight: 700;
+    transition: transform 120ms ease-out, box-shadow 120ms ease-out;
+}
+#generate-button button:not(:disabled) {
+    box-shadow: 0 12px 26px var(--idx-accent-soft);
+}
+.gradio-container #generate-button button:disabled,
+.gradio-container #generate-button button[disabled] {
+    background: var(--button-secondary-background-fill) !important;
+    border-color: var(--idx-border) !important;
+    color: var(--idx-text-muted) !important;
+    opacity: 0.78 !important;
+    box-shadow: none !important;
+}
+#generate-button button:active:not(:disabled) {
+    transform: scale(0.985);
+}
+#clear-button button {
+    min-height: 46px;
+}
+.action-row {
+    align-items: end;
+}
+.output-card {
+    position: sticky;
+    top: 18px;
+    align-self: start;
+    margin-top: 0;
+    background: var(--idx-output-bg) !important;
+    overflow: visible !important;
+}
+.block.generation-status {
+    position: relative;
+    display: flex;
+    width: 100% !important;
+    min-height: 84px;
+    align-items: center;
+    box-sizing: border-box;
+    padding: 12px 14px !important;
+    border: 1px solid var(--idx-border);
+    border-radius: 12px;
+    background: var(--idx-surface-soft);
+    overflow: visible !important;
+}
+.block.generation-status .prose.generation-status {
+    display: block;
+    width: 100%;
+    min-height: 0;
+    padding: 0 !important;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+}
+.block.generation-status .prose.generation-status p {
+    margin: 0;
+}
+.block.generation-status > .wrap.center.full {
+    border-radius: inherit;
+}
+.block.generation-status > .wrap.center.full:not(.hide) {
+    inset: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    min-height: 84px !important;
+    background: var(--idx-surface-soft) !important;
+    color: var(--idx-text) !important;
+    opacity: 1 !important;
+}
+.block.generation-status > .wrap.center.full:not(.hide) * {
+    color: var(--idx-text) !important;
+}
+.result-panel audio {
+    width: 100%;
+}
+.output-card > .styler {
+    background: transparent !important;
+}
+.output-card .html-container.padding {
+    padding: 0 0 8px !important;
+}
+.output-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+.output-header h3 {
+    margin: 0;
+    font-size: 16px;
+    line-height: 1.35;
+}
+.task-center-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 34px;
+    padding: 0 12px;
+    border: 1px solid var(--idx-border);
+    border-radius: 999px;
+    background: var(--idx-surface-soft);
+    color: var(--idx-text) !important;
+    font-size: 13px;
+    font-weight: 650;
+    text-decoration: none !important;
+}
+.task-center-link:hover {
+    border-color: var(--idx-accent);
+    color: var(--idx-accent) !important;
+}
+footer {
+    display: none !important;
+}
+@media (max-width: 1120px) {
+    .gradio-container {
+        width: min(980px, calc(100vw - 28px)) !important;
+    }
+    .workspace-grid {
+        grid-template-columns: minmax(0, 1.35fr) minmax(250px, 0.85fr);
+        grid-template-areas:
+            "reference result"
+            "content result";
+    }
+}
+@media (max-width: 760px) {
+    .gradio-container {
+        width: calc(100vw - 24px) !important;
+        padding: 12px 0 32px !important;
+    }
+    .hero-shell {
+        padding: 20px 18px;
+        border-radius: 16px;
+    }
+    .hero-shell h1 {
+        font-size: clamp(26px, 9vw, 34px);
+    }
+    .workspace-grid {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+            "reference"
+            "content"
+            "result";
+        gap: 14px !important;
+    }
+    .panel-card,
+    .output-card {
+        width: 100% !important;
+        padding: 16px !important;
+        border-radius: 16px !important;
+    }
+    .action-row {
+        flex-direction: column !important;
+    }
+    .action-row > * {
+        width: 100% !important;
+        min-width: 0 !important;
+    }
+    .output-header {
+        align-items: flex-start;
+    }
+}
+"""
+
+
+with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
+    gr.HTML(
+        """
+        <section class="hero-shell">
+            <div class="hero-kicker">本地运行 · 隐私优先</div>
+            <h1>IndexTTS 中文语音生成</h1>
+            <p>选择一段清晰的参考音频，输入需要补录的文本。页面会先检查输入，再进入本地生成队列。</p>
+        </section>
+        """
+    )
+
+    with gr.Row(equal_height=False, elem_classes="workspace-grid"):
+        with gr.Column(scale=1, min_width=0, elem_classes=["panel-card", "reference-panel"]):
+            gr.Markdown("### 1. 选择参考音频")
+            prompt_audio = gr.Audio(
+                label="音色参考音频",
+                key="prompt_audio",
+                sources=["upload", "microphone"],
+                type="filepath",
+                editable=False,
+                show_download_button=False,
+            )
+            with gr.Row(elem_classes="reference-actions"):
+                prepare_reference_button = gr.Button(
+                    "整理参考音频",
+                    variant="secondary",
+                    size="sm",
+                )
+            reference_quality_note = gr.Markdown(
+                "上传后会自动检查时长、音量、削波和静音比例。",
+                elem_classes=["section-note", "reference-quality-note"],
+            )
+            gr.Markdown(
+                "“整理参考音频”会在后端去除首尾静音并另存 WAV，原文件不会被覆盖。",
+                elem_classes="section-note",
+            )
+
+        with gr.Column(scale=1, min_width=0, elem_classes=["panel-card", "content-panel"]):
+            gr.Markdown("### 2. 填写生成内容")
+            project_name = gr.Textbox(
+                label=i18n("项目名称（可选）"),
+                value=i18n("默认项目"),
+                placeholder=i18n("例如：视频 A 开场补录"),
+            )
+            input_text_single = gr.TextArea(
+                label="需要生成的文本",
+                key="input_text_single",
+                placeholder=i18n("请输入目标文本"),
+                info=f"{i18n('当前模型版本')}{tts.model_version or '1.0'}",
+                lines=6,
+                max_lines=12,
+            )
+            readiness_note = gr.Markdown(
+                "请先上传参考音频，并填写需要生成的文本。",
+                elem_classes="status-copy",
+            )
+            with gr.Row(elem_classes="action-row"):
+                clear_button = gr.ClearButton(
+                    None,
+                    value="清空本次输入",
+                    variant="secondary",
+                    size="lg",
+                    elem_id="clear-button",
+                )
+                gen_button = gr.Button(
+                    "请完善输入",
+                    key="gen_button",
+                    interactive=False,
+                    variant="primary",
+                    size="lg",
+                    elem_id="generate-button",
+                )
+
+        with gr.Column(scale=1, min_width=0, elem_classes=["output-card", "result-panel"]):
+            gr.HTML(
+                f"""
+                <div class="output-header">
+                    <h3>3. 生成结果</h3>
+                    <a class="task-center-link" href="http://127.0.0.1:{TASK_CENTER_PORT}/" onclick="this.href='http://'+window.location.hostname+':{TASK_CENTER_PORT}/'" target="_blank" rel="noopener noreferrer">任务中心</a>
+                </div>
+                """
+            )
+            generation_status = gr.Markdown(
+                "等待生成",
+                elem_classes=["status-copy", "generation-status"],
+            )
+            output_audio = gr.Audio(
+                label="候选 1",
+                visible=False,
+                key="output_audio",
+                editable=False,
+                interactive=False,
+                show_download_button=True,
+            )
+            output_audio_2 = gr.Audio(
+                label="候选 2",
+                visible=False,
+                key="output_audio_2",
+                editable=False,
+                interactive=False,
+                show_download_button=True,
+            )
+            output_audio_3 = gr.Audio(
+                label="候选 3",
+                visible=False,
+                key="output_audio_3",
+                editable=False,
+                interactive=False,
+                show_download_button=True,
+            )
+
+    with gr.Accordion("声音与情感", open=False):
+        gr.Markdown("默认沿用音色参考音频的情感；只有需要精细控制时再展开设置。", elem_classes="section-note")
+        emo_control_method = gr.Radio(
+            choices=EMO_CHOICES,
+            type="index",
+            value=EMO_CHOICES[0],
+            label=i18n("情感控制方式"),
+        )
         with gr.Group(visible=False) as emotion_reference_group:
-            with gr.Row():
-                emo_upload = gr.Audio(label=i18n("上传情感参考音频"), type="filepath")
+            emo_upload = gr.Audio(
+                label=i18n("上传情感参考音频"),
+                type="filepath",
+                sources=["upload", "microphone"],
+                editable=False,
+                show_download_button=False,
+            )
+            emo_weight = gr.Slider(
+                label=i18n("情感权重"),
+                minimum=0.0,
+                maximum=1.6,
+                value=0.8,
+                step=0.01,
+            )
 
-            with gr.Row():
-                emo_weight = gr.Slider(label=i18n("情感权重"), minimum=0.0, maximum=1.6, value=0.8, step=0.01)
+        emo_random = gr.Checkbox(
+            label=i18n("情感随机采样"),
+            value=False,
+            visible=False,
+        )
 
-        # 情感随机采样
-        with gr.Row():
-            emo_random = gr.Checkbox(label=i18n("情感随机采样"),value=False,visible=False)
-
-        # 情感向量控制部分
         with gr.Group(visible=False) as emotion_vector_group:
             with gr.Row():
                 with gr.Column():
@@ -214,137 +929,236 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                     vec8 = gr.Slider(label=i18n("平静"), minimum=0.0, maximum=1.4, value=0.0, step=0.05)
 
         with gr.Group(visible=False) as emo_text_group:
-            with gr.Row():
-                emo_text = gr.Textbox(label=i18n("情感描述文本"), placeholder=i18n("请输入情绪描述（或留空以自动使用目标文本作为情绪描述）"), value="", info=i18n("例如：高兴，愤怒，悲伤等"))
-
-        with gr.Accordion(i18n("高级生成参数设置"), open=False):
-            with gr.Row():
-                with gr.Column(scale=1):
-                    gr.Markdown(f"**{i18n('GPT2 采样设置')}** _{i18n('参数会影响音频多样性和生成速度详见')} [Generation strategies](https://huggingface.co/docs/transformers/main/en/generation_strategies)._")
-                    with gr.Row():
-                        do_sample = gr.Checkbox(label="do_sample", value=True, info=i18n("是否进行采样"))
-                        temperature = gr.Slider(label="temperature", minimum=0.1, maximum=2.0, value=0.8, step=0.1)
-                    with gr.Row():
-                        top_p = gr.Slider(label="top_p", minimum=0.0, maximum=1.0, value=0.8, step=0.01)
-                        top_k = gr.Slider(label="top_k", minimum=0, maximum=100, value=30, step=1)
-                        num_beams = gr.Slider(label="num_beams", value=3, minimum=1, maximum=10, step=1)
-                    with gr.Row():
-                        repetition_penalty = gr.Number(label="repetition_penalty", precision=None, value=10.0, minimum=0.1, maximum=20.0, step=0.1)
-                        length_penalty = gr.Number(label="length_penalty", precision=None, value=0.0, minimum=-2.0, maximum=2.0, step=0.1)
-                    max_mel_tokens = gr.Slider(label="max_mel_tokens", value=1500, minimum=50, maximum=tts.cfg.gpt.max_mel_tokens, step=10, info=i18n("生成Token最大数量，过小导致音频被截断"), key="max_mel_tokens")
-                    # with gr.Row():
-                    #     typical_sampling = gr.Checkbox(label="typical_sampling", value=False, info="不建议使用")
-                    #     typical_mass = gr.Slider(label="typical_mass", value=0.9, minimum=0.0, maximum=1.0, step=0.1)
-                with gr.Column(scale=2):
-                    gr.Markdown(f'**{i18n("分句设置")}** _{i18n("参数会影响音频质量和生成速度")}_')
-                    with gr.Row():
-                        initial_value = max(20, min(tts.cfg.gpt.max_text_tokens, cmd_args.gui_seg_tokens))
-                        max_text_tokens_per_segment = gr.Slider(
-                            label=i18n("分句最大Token数"), value=initial_value, minimum=20, maximum=tts.cfg.gpt.max_text_tokens, step=2, key="max_text_tokens_per_segment",
-                            info=i18n("建议80~200之间，值越大，分句越长；值越小，分句越碎；过小过大都可能导致音频质量不高"),
-                        )
-                    with gr.Accordion(i18n("预览分句结果"), open=True) as segments_settings:
-                        segments_preview = gr.Dataframe(
-                            headers=[i18n("序号"), i18n("分句内容"), i18n("Token数")],
-                            key="segments_preview",
-                            wrap=True,
-                        )
-            advanced_params = [
-                do_sample, top_p, top_k, temperature,
-                length_penalty, num_beams, repetition_penalty, max_mel_tokens,
-                # typical_sampling, typical_mass,
-            ]
-        
-        if len(example_cases) > 0:
-            gr.Examples(
-                examples=example_cases,
-                examples_per_page=20,
-                inputs=[prompt_audio,
-                        emo_control_method,
-                        input_text_single,
-                        emo_upload,
-                        emo_weight,
-                        emo_text,
-                        vec1,vec2,vec3,vec4,vec5,vec6,vec7,vec8]
+            emo_text = gr.Textbox(
+                label=i18n("情感描述文本"),
+                placeholder=i18n("请输入情绪描述（或留空以自动使用目标文本作为情绪描述）"),
+                value="",
+                info=i18n("例如：高兴，愤怒，悲伤等"),
             )
 
-    def on_input_text_change(text, max_text_tokens_per_segment):
-        if text and len(text) > 0:
-            text_tokens_list = tts.tokenizer.tokenize(text)
+    with gr.Accordion(i18n("高级生成参数设置"), open=False):
+        gr.Markdown("不熟悉这些参数时建议保持默认值。", elem_classes="section-note")
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=1, min_width=340):
+                gr.Markdown("#### 采样参数")
+                with gr.Row():
+                    do_sample = gr.Checkbox(label="启用采样", value=True, info="关闭后生成结果会更加固定")
+                    temperature = gr.Slider(label="生成温度", minimum=0.1, maximum=2.0, value=0.8, step=0.1, info="数值越高，声音变化越明显")
+                with gr.Row():
+                    top_p = gr.Slider(label="核心采样概率", minimum=0.0, maximum=1.0, value=0.8, step=0.01)
+                    top_k = gr.Slider(label="候选词数量", minimum=0, maximum=100, value=30, step=1)
+                    num_beams = gr.Slider(label="束搜索数量", value=3, minimum=1, maximum=10, step=1)
+                with gr.Row():
+                    repetition_penalty = gr.Number(label="重复惩罚", precision=None, value=10.0, minimum=0.1, maximum=20.0, step=0.1)
+                    length_penalty = gr.Number(label="长度惩罚", precision=None, value=0.0, minimum=-2.0, maximum=2.0, step=0.1)
+                max_mel_tokens = gr.Slider(
+                    label="最大音频 Token 数",
+                    value=1500,
+                    minimum=50,
+                    maximum=tts.cfg.gpt.max_mel_tokens,
+                    step=10,
+                    info="数值过小可能导致音频被提前截断",
+                    key="max_mel_tokens",
+                )
+                normalize_output_peak = gr.Checkbox(
+                    label="安全补偿输出音量",
+                    value=True,
+                    info="自动利用剩余峰值空间，最多提高 6 dB，并保留约 -1 dBFS 余量",
+                )
+                with gr.Row():
+                    seed_value = gr.Number(
+                        label="随机种子",
+                        value=0,
+                        precision=0,
+                        info="相同种子可复现；填写 -1 会自动生成新种子",
+                    )
+                    candidate_count = gr.Slider(
+                        label="候选数量",
+                        minimum=1,
+                        maximum=3,
+                        value=1,
+                        step=1,
+                        info="增加候选更容易选到自然版本，也会相应增加生成时间",
+                    )
 
-            segments = tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=int(max_text_tokens_per_segment))
-            data = []
-            for i, s in enumerate(segments):
-                segment_str = ''.join(s)
-                tokens_count = len(s)
-                data.append([i, segment_str, tokens_count])
-            return {
-                segments_preview: gr.update(value=data, visible=True, type="array"),
-            }
-        else:
-            df = pd.DataFrame([], columns=[i18n("序号"), i18n("分句内容"), i18n("Token数")])
-            return {
-                segments_preview: gr.update(value=df),
-            }
-    def on_method_select(emo_control_method):
-        if emo_control_method == 1:
-            return (gr.update(visible=True),
-                    gr.update(visible=False),
-                    gr.update(visible=False),
-                    gr.update(visible=False)
-                    )
-        elif emo_control_method == 2:
-            return (gr.update(visible=False),
-                    gr.update(visible=True),
-                    gr.update(visible=True),
-                    gr.update(visible=False)
-                    )
-        elif emo_control_method == 3:
-            return (gr.update(visible=False),
-                    gr.update(visible=True),
-                    gr.update(visible=False),
-                    gr.update(visible=True)
-                    )
-        else:
-            return (gr.update(visible=False),
-                    gr.update(visible=False),
-                    gr.update(visible=False),
-                    gr.update(visible=False)
+            with gr.Column(scale=1, min_width=340):
+                gr.Markdown("#### 分句设置")
+                initial_value = max(20, min(tts.cfg.gpt.max_text_tokens, cmd_args.gui_seg_tokens))
+                max_text_tokens_per_segment = gr.Slider(
+                    label=i18n("分句最大Token数"),
+                    value=initial_value,
+                    minimum=20,
+                    maximum=tts.cfg.gpt.max_text_tokens,
+                    step=2,
+                    key="max_text_tokens_per_segment",
+                    info=i18n("建议80~200之间，值越大，分句越长；值越小，分句越碎；过小过大都可能导致音频质量不高"),
+                )
+                segment_note = gr.Markdown(
+                    "输入文本后会在这里预览模型分段。",
+                    elem_classes="status-copy",
+                )
+                with gr.Accordion(i18n("预览分句结果"), open=False):
+                    segments_preview = gr.Dataframe(
+                        value=empty_segments_frame(),
+                        headers=[i18n("序号"), i18n("分句内容"), i18n("Token数")],
+                        key="segments_preview",
+                        wrap=True,
+                        interactive=False,
                     )
 
-    emo_control_method.select(on_method_select,
-        inputs=[emo_control_method],
-        outputs=[emotion_reference_group,
-                 emo_random,
-                 emotion_vector_group,
-                 emo_text_group]
+    advanced_params = [
+        do_sample,
+        top_p,
+        top_k,
+        temperature,
+        length_penalty,
+        num_beams,
+        repetition_penalty,
+        max_mel_tokens,
+        normalize_output_peak,
+    ]
+
+    clear_button.add([
+        prompt_audio,
+        input_text_single,
+        emo_upload,
+        emo_text,
+        segments_preview,
+    ])
+    busy_state = gr.State(False)
+
+    clear_button.click(
+        reset_ui_state,
+        inputs=None,
+        outputs=[
+            gen_button,
+            readiness_note,
+            generation_status,
+            segment_note,
+            output_audio,
+            output_audio_2,
+            output_audio_3,
+            busy_state,
+            reference_quality_note,
+        ],
+        queue=False,
+        show_progress="hidden",
     )
 
+    prompt_audio.change(
+        update_reference_state,
+        inputs=[prompt_audio, input_text_single, busy_state],
+        outputs=[gen_button, readiness_note, reference_quality_note],
+        queue=False,
+        trigger_mode="always_last",
+        show_progress="hidden",
+    )
+    prepare_reference_button.click(
+        prepare_prompt_audio,
+        inputs=[prompt_audio],
+        outputs=[prompt_audio, reference_quality_note],
+        queue=False,
+        show_progress="full",
+    )
+    input_text_single.input(
+        update_submit_state,
+        inputs=[prompt_audio, input_text_single, busy_state],
+        outputs=[gen_button, readiness_note],
+        queue=False,
+        trigger_mode="always_last",
+        show_progress="hidden",
+    )
     input_text_single.change(
         on_input_text_change,
         inputs=[input_text_single, max_text_tokens_per_segment],
-        outputs=[segments_preview]
+        outputs=[segments_preview, segment_note],
+        queue=False,
+        trigger_mode="always_last",
+        show_progress="hidden",
     )
     max_text_tokens_per_segment.change(
         on_input_text_change,
         inputs=[input_text_single, max_text_tokens_per_segment],
-        outputs=[segments_preview]
+        outputs=[segments_preview, segment_note],
+        queue=False,
+        trigger_mode="always_last",
+        show_progress="hidden",
     )
-    prompt_audio.upload(update_prompt_audio,
-                         inputs=[],
-                         outputs=[gen_button])
+    emo_control_method.select(
+        on_method_select,
+        inputs=[emo_control_method],
+        outputs=[emotion_reference_group, emo_random, emotion_vector_group, emo_text_group],
+        queue=False,
+        show_progress="hidden",
+    )
 
-    gen_button.click(gen_single,
-                     inputs=[emo_control_method,prompt_audio, input_text_single, emo_upload, emo_weight,
-                            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
-                             emo_text,emo_random,
-                             max_text_tokens_per_segment,
-                             *advanced_params,
-                     ],
-                     outputs=[output_audio])
-
+    job_id_state = gr.State("")
+    generation_request_state = gr.State({})
+    clear_button.add([job_id_state, generation_request_state])
+    register_event = gen_button.click(
+        register_job,
+        inputs=[
+            project_name,
+            input_text_single,
+            prompt_audio,
+            emo_control_method,
+            emo_upload,
+            emo_weight,
+            vec1,
+            vec2,
+            vec3,
+            vec4,
+            vec5,
+            vec6,
+            vec7,
+            vec8,
+            emo_text,
+            emo_random,
+            max_text_tokens_per_segment,
+            seed_value,
+            candidate_count,
+            *advanced_params,
+        ],
+        outputs=[
+            job_id_state,
+            generation_request_state,
+            gen_button,
+            clear_button,
+            generation_status,
+            busy_state,
+        ],
+        queue=False,
+        trigger_mode="once",
+        show_progress="hidden",
+    )
+    generation_event = register_event.success(
+        gen_single,
+        inputs=[job_id_state, generation_request_state],
+        outputs=[output_audio, output_audio_2, output_audio_3, generation_status],
+        concurrency_limit=1,
+        concurrency_id="tts-generation",
+        trigger_mode="once",
+        show_progress="full",
+        # Bind progress to the always-visible status surface. The audio player is
+        # hidden before the first result, so targeting it can hide the overlay.
+        show_progress_on=[generation_status],
+    )
+    generation_event.failure(
+        mark_generation_failed,
+        inputs=None,
+        outputs=[generation_status],
+        queue=False,
+        show_progress="hidden",
+    )
+    generation_event.then(
+        restore_action_buttons,
+        inputs=[prompt_audio, input_text_single],
+        outputs=[gen_button, clear_button, busy_state],
+        queue=False,
+        show_progress="hidden",
+    )
 
 
 if __name__ == "__main__":
-    demo.queue(20)
+    demo.queue(max_size=20, default_concurrency_limit=1)
     demo.launch(server_name=cmd_args.host, server_port=cmd_args.port)
