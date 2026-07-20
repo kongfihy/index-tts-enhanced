@@ -71,6 +71,7 @@ from indextts_dubbing.candidates import (
     read_candidate_manifest,
     write_candidate_manifest,
 )
+from indextts_dubbing.audio.loudness_matcher import write_loudness_matched_copy
 from tools.i18n.i18n import I18nAuto
 from indextts_task_center import (
     JobAlreadyRunning,
@@ -157,6 +158,7 @@ def register_job(project_name, text, prompt,
             "request_key": generation_request_key(request_snapshot),
             "seed": candidate_plan.base_seed,
             "candidate_count": candidate_plan.count,
+            "loudness_ab": bool(clean_advanced_args[-1]),
         },
         seed=candidate_plan.base_seed,
     )
@@ -211,6 +213,9 @@ def reset_ui_state():
         gr.update(value=None, visible=False),
         gr.update(value=None, visible=False),
         gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False),
         False,
         "上传后会自动检查时长、音量、削波和静音比例。",
     )
@@ -220,12 +225,21 @@ def mark_generation_failed():
     return "生成未完成，请根据页面提示检查输入；任务详情可在任务中心查看。"
 
 
-def candidate_result_updates(paths):
-    clean_paths = [str(path) for path in paths if path]
-    padded = (clean_paths + [None, None, None])[:3]
+def candidate_result_updates(results):
+    clean_results = []
+    for index, result in enumerate(results or [], start=1):
+        if isinstance(result, dict):
+            path = result.get("path")
+            label = result.get("label") or f"生成结果 {index}"
+        else:
+            path = result
+            label = f"生成结果 {index}"
+        if path:
+            clean_results.append((str(path), str(label)))
+    padded = (clean_results + [(None, "生成结果")] * 6)[:6]
     return tuple(
-        gr.update(value=path, visible=bool(path))
-        for path in padded
+        gr.update(value=path, label=label, visible=bool(path))
+        for path, label in padded
     )
 
 
@@ -235,17 +249,17 @@ def gen_single(job_id, request_snapshot, progress=gr.Progress()):
         should_run, existing_output = job_manager.start_job(job_id)
     except JobCancelled:
         gr.Warning(i18n("任务已取消"))
-        return gr.update(), gr.update(), gr.update(), "任务已取消"
+        return *(gr.update() for _ in range(6)), "任务已取消"
     except JobAlreadyRunning as exc:
         gr.Warning(str(exc))
-        return gr.update(), gr.update(), gr.update(), "相同任务已经在生成，请在任务中心查看进度。"
+        return *(gr.update() for _ in range(6)), "相同任务已经在生成，请在任务中心查看进度。"
     except RuntimeError as exc:
         raise gr.Error(str(exc))
 
     if not should_run:
-        restored = [item["path"] for item in read_candidate_manifest(output_root, job_id)]
+        restored = read_candidate_manifest(output_root, job_id)
         if not restored and existing_output:
-            restored = [existing_output]
+            restored = [{"path": existing_output, "label": "已完成结果"}]
         return (
             *candidate_result_updates(restored),
             f"检测到相同任务已经完成，已恢复 {len(restored) or 1} 个生成结果。",
@@ -283,7 +297,7 @@ def gen_single(job_id, request_snapshot, progress=gr.Progress()):
 
         do_sample, top_p, top_k, temperature, \
             length_penalty, num_beams, repetition_penalty, max_mel_tokens, \
-            normalize_output_peak = advanced_args
+            create_loudness_match = advanced_args
         kwargs = {
             "do_sample": bool(do_sample),
             "top_p": float(top_p),
@@ -293,7 +307,10 @@ def gen_single(job_id, request_snapshot, progress=gr.Progress()):
             "num_beams": int(num_beams),
             "repetition_penalty": float(repetition_penalty),
             "max_mel_tokens": int(max_mel_tokens),
-            "normalize_output_peak": bool(normalize_output_peak),
+            # Keep the first result as the untouched dry version. The optional
+            # reference-level copy is produced afterwards from this same file,
+            # so A/B comparison never requires a second model inference.
+            "normalize_output_peak": False,
         }
         if emotion_method == 0:
             emo_ref_path = None
@@ -310,17 +327,23 @@ def gen_single(job_id, request_snapshot, progress=gr.Progress()):
 
         shutil.rmtree(candidate_root, ignore_errors=True)
         candidate_root.mkdir(parents=True, exist_ok=True)
+        generated_results = []
         generated_paths = []
+        generated_seeds = []
+        generated_labels = []
+        generated_variants = []
+        match_summaries = []
         for index, (seed, output_path) in enumerate(zip(candidate_seeds, output_paths)):
+            candidate_number = index + 1
             tts.gr_progress = JobProgress(
                 job_manager,
                 job_id,
                 progress,
                 progress_start=index / candidate_plan.count,
                 progress_span=1.0 / candidate_plan.count,
-                description_prefix=f"候选 {index + 1}/{candidate_plan.count} · ",
+                description_prefix=f"候选 {candidate_number}/{candidate_plan.count} · ",
             )
-            output = tts.infer(
+            dry_output = tts.infer(
                 spk_audio_prompt=prompt,
                 text=clean_text,
                 output_path=str(output_path),
@@ -335,15 +358,46 @@ def gen_single(job_id, request_snapshot, progress=gr.Progress()):
                 seed=seed,
                 **kwargs,
             )
-            generated_paths.append(output)
+            dry_label = f"候选 {candidate_number} · 原始干声"
+            generated_results.append({"path": dry_output, "label": dry_label})
+            generated_paths.append(dry_output)
+            generated_seeds.append(seed)
+            generated_labels.append(dry_label)
+            generated_variants.append("dry")
 
-        write_candidate_manifest(output_root, job_id, generated_paths, candidate_seeds)
+            if create_loudness_match:
+                matched_path = output_path.with_name(output_path.stem + "-level-matched.wav")
+                matched_output, match_stats = write_loudness_matched_copy(
+                    dry_output,
+                    prompt,
+                    matched_path,
+                )
+                matched_label = f"候选 {candidate_number} · 安全响度匹配"
+                generated_results.append({"path": matched_output, "label": matched_label})
+                generated_paths.append(matched_output)
+                generated_seeds.append(seed)
+                generated_labels.append(matched_label)
+                generated_variants.append("level_matched")
+                match_summaries.append(f"候选 {candidate_number}：{match_stats.summary()}")
+
+        write_candidate_manifest(
+            output_root,
+            job_id,
+            generated_paths,
+            generated_seeds,
+            labels=generated_labels,
+            variants=generated_variants,
+        )
         job_manager.complete_job(job_id, generated_paths)
         seed_text = "、".join(str(seed) for seed in candidate_seeds)
-        return (
-            *candidate_result_updates(generated_paths),
-            f"生成完成 · {len(generated_paths)} 个候选 · 随机种子 {seed_text}",
-        )
+        if match_summaries:
+            status = (
+                f"生成完成 · {candidate_plan.count} 个候选，每个保留原始干声和安全响度匹配版 · "
+                f"随机种子 {seed_text}\n\n" + "\n\n".join(match_summaries)
+            )
+        else:
+            status = f"生成完成 · {candidate_plan.count} 个原始干声候选 · 随机种子 {seed_text}"
+        return (*candidate_result_updates(generated_results), status)
     except Exception as exc:
         job_manager.fail_job(job_id, exc)
         shutil.rmtree(candidate_root, ignore_errors=True)
@@ -860,30 +914,57 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
                 "等待生成",
                 elem_classes=["status-copy", "generation-status"],
             )
-            output_audio = gr.Audio(
-                label="候选 1",
-                visible=False,
-                key="output_audio",
-                editable=False,
-                interactive=False,
-                show_download_button=True,
-            )
-            output_audio_2 = gr.Audio(
-                label="候选 2",
-                visible=False,
-                key="output_audio_2",
-                editable=False,
-                interactive=False,
-                show_download_button=True,
-            )
-            output_audio_3 = gr.Audio(
-                label="候选 3",
-                visible=False,
-                key="output_audio_3",
-                editable=False,
-                interactive=False,
-                show_download_button=True,
-            )
+            with gr.Row():
+                output_audio = gr.Audio(
+                    label="候选 1 · 原始干声",
+                    visible=False,
+                    key="output_audio",
+                    editable=False,
+                    interactive=False,
+                    show_download_button=True,
+                )
+                output_audio_2 = gr.Audio(
+                    label="候选 1 · 安全响度匹配",
+                    visible=False,
+                    key="output_audio_2",
+                    editable=False,
+                    interactive=False,
+                    show_download_button=True,
+                )
+            with gr.Row():
+                output_audio_3 = gr.Audio(
+                    label="候选 2 · 原始干声",
+                    visible=False,
+                    key="output_audio_3",
+                    editable=False,
+                    interactive=False,
+                    show_download_button=True,
+                )
+                output_audio_4 = gr.Audio(
+                    label="候选 2 · 安全响度匹配",
+                    visible=False,
+                    key="output_audio_4",
+                    editable=False,
+                    interactive=False,
+                    show_download_button=True,
+                )
+            with gr.Row():
+                output_audio_5 = gr.Audio(
+                    label="候选 3 · 原始干声",
+                    visible=False,
+                    key="output_audio_5",
+                    editable=False,
+                    interactive=False,
+                    show_download_button=True,
+                )
+                output_audio_6 = gr.Audio(
+                    label="候选 3 · 安全响度匹配",
+                    visible=False,
+                    key="output_audio_6",
+                    editable=False,
+                    interactive=False,
+                    show_download_button=True,
+                )
 
     with gr.Accordion("声音与情感", open=False):
         gr.Markdown("默认沿用音色参考音频的情感；只有需要精细控制时再展开设置。", elem_classes="section-note")
@@ -960,10 +1041,10 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
                     info="数值过小可能导致音频被提前截断",
                     key="max_mel_tokens",
                 )
-                normalize_output_peak = gr.Checkbox(
-                    label="安全补偿输出音量",
+                create_loudness_match = gr.Checkbox(
+                    label="同时生成安全响度匹配版（A/B）",
                     value=True,
-                    info="自动利用剩余峰值空间，最多提高 6 dB，并保留约 -1 dBFS 余量",
+                    info="保留原始干声，并按参考音频有效人声响度做一次线性匹配；最多提高 6 dB 或降低 12 dB，峰值保护约 -1 dBFS",
                 )
                 with gr.Row():
                     seed_value = gr.Number(
@@ -1015,7 +1096,7 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
         num_beams,
         repetition_penalty,
         max_mel_tokens,
-        normalize_output_peak,
+        create_loudness_match,
     ]
 
     clear_button.add([
@@ -1038,6 +1119,9 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
             output_audio,
             output_audio_2,
             output_audio_3,
+            output_audio_4,
+            output_audio_5,
+            output_audio_6,
             busy_state,
             reference_quality_note,
         ],
@@ -1134,7 +1218,15 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
     generation_event = register_event.success(
         gen_single,
         inputs=[job_id_state, generation_request_state],
-        outputs=[output_audio, output_audio_2, output_audio_3, generation_status],
+        outputs=[
+            output_audio,
+            output_audio_2,
+            output_audio_3,
+            output_audio_4,
+            output_audio_5,
+            output_audio_6,
+            generation_status,
+        ],
         concurrency_limit=1,
         concurrency_id="tts-generation",
         trigger_mode="once",

@@ -307,6 +307,8 @@ class JobManagerQueueTests(unittest.TestCase):
     def test_task_center_page_contains_grouped_versions_and_downloads(self):
         self.assertIn("projectGroup", ADMIN_HTML)
         self.assertIn("版本 ${x.project_version}", ADMIN_HTML)
+        self.assertIn("下载结果 ${o.index}", ADMIN_HTML)
+        self.assertIn("${resultCount} 个结果", ADMIN_HTML)
         self.assertIn("打包下载全部", ADMIN_HTML)
         self.assertIn("局域网只读", ADMIN_HTML)
 

@@ -116,9 +116,9 @@ def normalize_advanced_generation_args(values) -> list[bool | float | int]:
         num_beams,
         repetition_penalty,
         max_mel_tokens,
-        normalize_output_peak,
+        create_loudness_match,
     ) = values
-    if not isinstance(do_sample, bool) or not isinstance(normalize_output_peak, bool):
+    if not isinstance(do_sample, bool) or not isinstance(create_loudness_match, bool):
         raise ValueError("生成开关状态异常，请刷新页面后重试")
 
     normalized = [
@@ -130,7 +130,7 @@ def normalize_advanced_generation_args(values) -> list[bool | float | int]:
         int(num_beams),
         float(repetition_penalty),
         int(max_mel_tokens),
-        normalize_output_peak,
+        create_loudness_match,
     ]
     (
         _,

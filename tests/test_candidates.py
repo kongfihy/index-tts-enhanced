@@ -36,6 +36,28 @@ class CandidateHelpersTests(unittest.TestCase):
             self.assertEqual(candidates[0]["seed"], 7)
             self.assertEqual(candidates[0]["path"], str(paths[0]))
 
+    def test_manifest_preserves_result_labels_and_variants(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = candidate_output_paths(root, "job-2", [9])[0]
+            matched = path.with_name(path.stem + "-level-matched.wav")
+            path.parent.mkdir(parents=True)
+            path.touch()
+            matched.touch()
+
+            write_candidate_manifest(
+                root,
+                "job-2",
+                [path, matched],
+                [9, 9],
+                labels=["候选 1 · 原始干声", "候选 1 · 安全响度匹配"],
+                variants=["dry", "level_matched"],
+            )
+
+            candidates = read_candidate_manifest(root, "job-2")
+            self.assertEqual([item["variant"] for item in candidates], ["dry", "level_matched"])
+            self.assertEqual(candidates[1]["label"], "候选 1 · 安全响度匹配")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -49,17 +49,34 @@ def write_candidate_manifest(
     job_id: str,
     paths,
     seeds,
+    *,
+    labels=None,
+    variants=None,
 ) -> Path:
     root = candidate_directory(output_root, job_id)
     root.mkdir(parents=True, exist_ok=True)
     manifest = root / "candidates.json"
-    payload = {
-        "job_id": str(job_id),
-        "candidates": [
-            {"index": index, "seed": int(seed), "path": str(Path(path))}
-            for index, (seed, path) in enumerate(zip(seeds, paths), start=1)
-        ],
-    }
+    paths = list(paths)
+    seeds = list(seeds)
+    if len(paths) != len(seeds):
+        raise ValueError("生成结果与随机种子数量不一致")
+    labels = list(labels) if labels is not None else [None] * len(paths)
+    variants = list(variants) if variants is not None else [None] * len(paths)
+    if len(labels) != len(paths) or len(variants) != len(paths):
+        raise ValueError("生成结果元数据数量不一致")
+
+    candidates = []
+    for index, (seed, path, label, variant) in enumerate(
+        zip(seeds, paths, labels, variants),
+        start=1,
+    ):
+        item = {"index": index, "seed": int(seed), "path": str(Path(path))}
+        if label:
+            item["label"] = str(label)
+        if variant:
+            item["variant"] = str(variant)
+        candidates.append(item)
+    payload = {"job_id": str(job_id), "candidates": candidates}
     temporary = manifest.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     temporary.replace(manifest)
