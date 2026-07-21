@@ -1,358 +1,245 @@
-
 <div align="center">
-<img src='assets/index_icon.png' width="250"/>
+  <img src="assets/index_icon.png" width="180" alt="IndexTTS Enhanced" />
+
+# IndexTTS Enhanced
+
+**面向本地视频补录与中文配音工作流的 IndexTTS2 非官方增强版本**
+
+[上游项目](https://github.com/index-tts/index-tts) · [开发计划](docs/DEVELOPMENT_PLAN.md) · [许可证](LICENSE)
 </div>
 
+> [!IMPORTANT]
+> 本项目是基于 [IndexTTS2](https://github.com/index-tts/index-tts) 的非官方衍生版本，主要增加本地任务管理、多候选生成、音频交付处理和 macOS 使用体验。
+> 本项目不代表 IndexTTS、IndexTeam 或 bilibili 的官方版本、认可或担保。原始模型、代码和相关权利归原项目权利方所有。
 
-## 👉🏻 IndexTTS2 👈🏻
+## 项目定位
 
-<center><h3>IndexTTS2: A Breakthrough in Emotionally Expressive and Duration-Controlled Auto-Regressive Zero-Shot Text-to-Speech</h3></center>
+IndexTTS Enhanced 不是新的基础语音模型，也不重新分发模型权重。它保留 IndexTTS2 的核心推理能力，在其上补充更适合视频制作和本地补录的完整工作流：
 
-[![IndexTTS2](assets/IndexTTS2_banner.png)](assets/IndexTTS2_banner.png)
+```text
+参考音频检查
+→ 文本和生成参数确认
+→ 一个或多个可复现候选
+→ 原始干声与可选交付匹配版
+→ 项目化任务历史
+→ 试听、选择最佳版本和下载
+```
 
-<div align="center">
-  <a href='https://arxiv.org/abs/2506.21619'>
-    <img src='https://img.shields.io/badge/ArXiv-2506.21619-red?logo=arxiv'/>
-  </a>
-  <br/>
-  <a href='https://github.com/index-tts/index-tts'>
-    <img src='https://img.shields.io/badge/GitHub-Code-orange?logo=github'/>
-  </a>
-  <a href='https://index-tts.github.io/index-tts2.github.io/'>
-    <img src='https://img.shields.io/badge/GitHub-Demo-orange?logo=github'/>
-  </a>
-  <br/>
-  <a href='https://huggingface.co/spaces/IndexTeam/IndexTTS-2-Demo'>
-    <img src='https://img.shields.io/badge/HuggingFace-Demo-blue?logo=huggingface'/>
-  </a>
-  <a href='https://huggingface.co/IndexTeam/IndexTTS-2'>
-    <img src='https://img.shields.io/badge/HuggingFace-Model-blue?logo=huggingface' />
-  </a>
-  <br/>
-  <!--a href='https://modelscope.cn/studios/IndexTeam/IndexTTS-Demo'>
-    <img src='https://img.shields.io/badge/ModelScope-Demo-purple?logo=modelscope'/>
-  </a-->
-  <a href='https://modelscope.cn/models/IndexTeam/IndexTTS-2'>
-    <img src='https://img.shields.io/badge/ModelScope-Model-purple?logo=modelscope'/>
-  </a>
-</div>
+项目当前以本地单机和可信局域网使用为主，重点是：
 
+- 不覆盖原始输出；
+- 不丢失历史版本；
+- 参数和随机种子可追溯；
+- 音频后处理可开关并可进行 A/B 对比；
+- 在 Apple Silicon / MPS 环境中保持可控的内存占用；
+- 所有真实推理、测试素材和生产部署由使用者本地控制。
 
-### Abstract
+## 相比上游增加了什么
 
-Existing autoregressive large-scale text-to-speech (TTS) models have advantages in speech naturalness, but their token-by-token generation mechanism makes it difficult to precisely control the duration of synthesized speech. This becomes a significant limitation in applications requiring strict audio-visual synchronization, such as video dubbing.
+### 中文生成界面
 
-This paper introduces IndexTTS2, which proposes a novel, general, and autoregressive model-friendly method for speech duration control.
+- 中文优先的 WebUI；
+- 深浅色自适应和响应式布局；
+- 参考音频时长、响度、削波和静音比例检查；
+- 更稳妥的参考音频裁剪与预处理；
+- 文本分句预览和更清晰的高级参数说明。
 
-The method supports two generation modes: one explicitly specifies the number of generated tokens to precisely control speech duration; the other freely generates speech in an autoregressive manner without specifying the number of tokens, while faithfully reproducing the prosodic features of the input prompt.
+### 多候选与可复现生成
 
-Furthermore, IndexTTS2 achieves disentanglement between emotional expression and speaker identity, enabling independent control over timbre and emotion. In the zero-shot setting, the model can accurately reconstruct the target timbre (from the timbre prompt) while perfectly reproducing the specified emotional tone (from the style prompt).
+- 固定随机种子；
+- 单次任务可生成 1～3 个候选；
+- 每个候选使用独立 seed 和独立输出文件；
+- 相同项目自动保存为多个历史版本；
+- 结果不会因为下一次生成而被覆盖；
+- 可以在任务中心标记并持久保存“最佳版本”。
 
-To enhance speech clarity in highly emotional expressions, we incorporate GPT latent representations and design a novel three-stage training paradigm to improve the stability of the generated speech. Additionally, to lower the barrier for emotional control, we designed a soft instruction mechanism based on text descriptions by fine-tuning Qwen3, effectively guiding the generation of speech with the desired emotional orientation.
+当前模型推理仍然是**单 Worker 串行执行**。多进程推理尚未作为默认功能开放，必须先完成真实三候选基线和稳定性测试，详见 [开发计划](docs/DEVELOPMENT_PLAN.md)。
 
-Finally, experimental results on multiple datasets show that IndexTTS2 outperforms state-of-the-art zero-shot TTS models in terms of word error rate, speaker similarity, and emotional fidelity. Audio samples are available at: <a href="https://index-tts.github.io/index-tts2.github.io/">IndexTTS2 demo page</a>.
+### 原始干声与交付版本
 
-**Tips:** Please contact the authors for more detailed information. For commercial usage and cooperation, please contact <u>indexspeech@bilibili.com</u>.
+每个候选始终保留模型原始干声，并可额外生成：
 
+- 安全响度匹配版；
+- 与参考音频采样率、声道数和有效人声响度匹配的交付版；
+- 约 `-1 dBFS` 峰值保护；
+- 单独下载或打包下载全部结果。
 
-### Feel IndexTTS2
+这些交付副本不会触发第二次模型推理，也不会替换原始输出。
 
-<div align="center">
+### 本地任务中心
 
-**IndexTTS2: The Future of Voice, Now Generating**
+- SQLite 本地任务历史；
+- 排队、准备、生成、后处理、完成、失败和取消状态；
+- 项目分组和版本展开；
+- 当前任务进度和安全取消；
+- 每个生成结果单独下载；
+- 全部候选打包下载；
+- 局域网可查看和下载，本机拥有管理操作权限；
+- 服务重启后恢复无法继续的任务状态，避免幽灵排队任务。
 
-[![IndexTTS2 Demo](assets/IndexTTS2-video-pic.png)](https://www.bilibili.com/video/BV136a9zqEk5)
+### Apple Silicon 与 macOS
 
-*Click the image to watch the IndexTTS2 introduction video.*
+- MPS 推理内存清理和缓存释放；
+- 分段推理临时张量回收；
+- Hugging Face 和运行时缓存使用稳定的 macOS 可写目录；
+- macOS 菜单栏应用源码；
+- 本机/局域网访问切换、服务状态、任务状态和取消入口。
 
-</div>
+## 快速开始
 
+### 1. 准备环境
 
-### Contact
+需要：
 
-QQ Group：553460296(No.1) 663272642(No.4)  \
-Discord：https://discord.gg/uT32E7KDmy  \
-Email：indexspeech@bilibili.com  \
-You are welcome to join our community! 🌏  \
-欢迎大家来交流讨论！
-
-
-## 📣 Updates
-
-- `2025/09/08` 🔥🔥🔥  We release **IndexTTS-2** to the world!
-    - The first autoregressive TTS model with precise synthesis duration control, supporting both controllable and uncontrollable modes. <i>This functionality is not yet enabled in this release.</i>
-    - The model achieves highly expressive emotional speech synthesis, with emotion-controllable capabilities enabled through multiple input modalities.
-- `2025/05/14` 🔥🔥 We release **IndexTTS-1.5**, significantly improving the model's stability and its performance in the English language.
-- `2025/03/25` 🔥 We release **IndexTTS-1.0** with model weights and inference code.
-- `2025/02/12` 🔥 We submitted our paper to arXiv, and released our demos and test sets.
-
-
-## 🖥️ Neural Network Architecture
-
-Architectural overview of IndexTTS2, our state-of-the art speech model:
-
-<picture>
-  <img src="assets/IndexTTS2.png"  width="800"/>
-</picture>
-
-
-The key contributions of **IndexTTS2** are summarized as follows:
-
- - We propose a duration adaptation scheme for autoregressive TTS models. IndexTTS2 is the first autoregressive zero-shot TTS model to combine precise duration control with natural duration generation, and the method is scalable for any autoregressive large-scale TTS model.  
- - The emotional and speaker-related features are decoupled from the prompts, and a feature fusion strategy is designed to maintain semantic fluency and pronunciation clarity during emotionally rich expressions. Furthermore, a tool was developed for emotion control, utilizing natural language descriptions for the benefit of users.  
- - To address the lack of highly expressive speech data, we propose an effective training strategy, significantly enhancing the emotional expressiveness of zeroshot TTS to State-of-the-Art (SOTA) level.  
- - We will publicly release the code and pre-trained weights to facilitate future research and practical applications.  
-
-
-## Model Download
-
-| **HuggingFace**                                          | **ModelScope** |
-|----------------------------------------------------------|----------------------------------------------------------|
-| [😁 IndexTTS-2](https://huggingface.co/IndexTeam/IndexTTS-2) | [IndexTTS-2](https://modelscope.cn/models/IndexTeam/IndexTTS-2) |
-| [IndexTTS-1.5](https://huggingface.co/IndexTeam/IndexTTS-1.5) | [IndexTTS-1.5](https://modelscope.cn/models/IndexTeam/IndexTTS-1.5) |
-| [IndexTTS](https://huggingface.co/IndexTeam/Index-TTS) | [IndexTTS](https://modelscope.cn/models/IndexTeam/Index-TTS) |
-
-
-## Usage Instructions
-
-### ⚙️ Environment Setup
-
-1. Ensure that you have both [git](https://git-scm.com/downloads)
-   and [git-lfs](https://git-lfs.com/) on your system.
-
-The Git-LFS plugin must also be enabled on your current user account:
+- macOS 或支持 PyTorch 的 Linux 环境；
+- Python 与 [uv](https://docs.astral.sh/uv/)；
+- Git 和 [Git LFS](https://git-lfs.com/)；
+- 足够的磁盘与内存空间存放 IndexTTS2 模型。
 
 ```bash
 git lfs install
-```
-
-2. Download this repository:
-
-```bash
-git clone https://github.com/index-tts/index-tts.git && cd index-tts
-git lfs pull  # download large repository files
-```
-
-3. Install the [uv](https://docs.astral.sh/uv/getting-started/installation/) package
-   manager. It is *required* for a reliable, modern installation environment.
-
-4. Install required dependencies:
-
-We use `uv` to manage the project's dependency environment. The following command
-will install the correct versions of all dependencies into your `.venv` directory.
-
-```bash
+git clone https://github.com/kongfihy/index-tts-enhanced.git
+cd index-tts-enhanced
+git lfs pull
 uv sync --all-extras
 ```
 
-If the download is slow, please try a *local mirror*, for example China:
+### 2. 下载官方模型
 
-```bash
-uv sync --all-extras --default-index "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-```
-
-**Tip:** You can remove the `--all-extras` flag if you don't want to install the WebUI support.
-
-**Important:** If you see an error about CUDA during the installation, please ensure
-that you have installed NVIDIA's [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit)
-version 12.8 (or newer) on your system.
-
-5. Download the required models:
-
-Download via `huggingface-cli`:
+模型权重不包含在本仓库中。可以通过 Hugging Face 下载：
 
 ```bash
 uv tool install "huggingface_hub[cli]"
-
-hf download IndexTeam/IndexTTS-2 --local-dir=checkpoints
+hf download IndexTeam/IndexTTS-2 --local-dir checkpoints
 ```
 
-Or download via `modelscope`:
+也可以参考上游项目提供的 [ModelScope 下载方式](https://github.com/index-tts/index-tts#model-download)。
+
+### 3. 启动 WebUI
 
 ```bash
-uv tool install "modelscope"
-
-modelscope download --model IndexTeam/IndexTTS-2 --local_dir checkpoints
+uv run webui.py \
+  --host 127.0.0.1 \
+  --port 7860 \
+  --model_dir ./checkpoints
 ```
 
-> In addition to the above models, some small models will also be automatically
-> downloaded when the project is run for the first time. If your network environment
-> has slow access to HuggingFace, it is recommended to execute the following
-> command before running the code:
-> 
-> 除了以上模型外，项目初次运行时还会自动下载一些小模型，如果您的网络环境访问HuggingFace的速度较慢，推荐执行：
-> 
-> ```bash
-> export HF_ENDPOINT="https://hf-mirror.com"
-> ```
+启动后：
 
+- 生成页面：`http://127.0.0.1:7860`
+- 任务中心：`http://127.0.0.1:7861`
 
-#### 🖥️ Checking PyTorch GPU Acceleration
-
-If you need to diagnose your environment to see which GPUs are detected,
-you can use our included utility to check your system:
+如果需要在可信局域网中访问：
 
 ```bash
-uv run tools/gpu_check.py
+uv run webui.py \
+  --host 0.0.0.0 \
+  --port 7860 \
+  --model_dir ./checkpoints
 ```
 
+> [!WARNING]
+> 当前 WebUI 没有面向公网的登录、权限、配额和安全隔离。不要直接暴露到互联网，只应在本机或可信局域网中使用。
 
-### 🔥 IndexTTS2 Quickstart
+## macOS 菜单栏应用
 
-#### 🌐 Web Demo
+菜单栏应用源码位于：
+
+```text
+apps/macos/IndexTTSMenuBar
+```
+
+运行测试：
 
 ```bash
-uv run webui.py
+swift test --package-path apps/macos/IndexTTSMenuBar
 ```
 
-Open your browser and visit `http://127.0.0.1:7860` to see the demo.
+构建与安装说明见：
 
+```text
+apps/macos/IndexTTSMenuBar/README.md
+```
 
-#### 📝 Using IndexTTS2 in Python
+构建开发应用不会自动替换已经安装的生产版本。
 
-To run scripts, you *must* use the `uv run <file.py>` command to ensure that
-the code runs inside your current "uv" environment. It *may* also be necessary
-to add the current directory to your `PYTHONPATH`, to help it find the IndexTTS
-modules.
+## 测试
 
-Example of running a script via `uv`:
+Python 测试：
 
 ```bash
-PYTHONPATH="$PYTHONPATH:." uv run indextts/infer_v2.py
+PYTHONPATH="$PWD" uv run python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-Here are several examples of how to use IndexTTS2 in your own scripts:
+Swift 测试：
 
-1. Synthesize new speech with a single reference audio file (voice cloning):
-
-```python
-from indextts.infer_v2 import IndexTTS2
-tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, use_cuda_kernel=False)
-text = "Translate for me, what is a surprise!"
-tts.infer(spk_audio_prompt='examples/voice_01.wav', text=text, output_path="gen.wav", verbose=True)
+```bash
+swift test --package-path apps/macos/IndexTTSMenuBar
 ```
 
-2. Using a separate, emotional reference audio file to condition the speech synthesis:
+真实模型推理不属于默认单元测试。真实参考音频、模型权重、生成结果、数据库和日志不应提交到仓库。
 
-```python
-from indextts.infer_v2 import IndexTTS2
-tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, use_cuda_kernel=False)
-text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
-tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, output_path="gen.wav", emo_audio_prompt="examples/emo_sad.wav", verbose=True)
+## 输出与隐私
+
+仓库默认忽略：
+
+- `checkpoints/` 模型权重；
+- `outputs/` 生成结果；
+- `prompts/` 用户参考音频；
+- 常见音频和视频文件；
+- SQLite 数据库、日志和进程状态；
+- `.env`、密钥和签名材料；
+- macOS 构建产物和本地交接记录。
+
+提交或发布前仍应检查 Git 状态和差异，不要使用未经审查的 `git add .`。
+
+## 开发计划
+
+近期顺序：
+
+1. 将候选数量移到主生成操作区；
+2. 提供“快速生成 1 个”和“生成 3 个候选”；
+3. 在主页面使用候选卡片直接试听、下载和标记最佳版本；
+4. 使用用户确认的真实音频建立默认平衡模式的三候选串行基线；
+5. 基线完成后比较单进程串行与两个独立模型进程；
+6. 只有吞吐、稳定性、可复现性和内存测试全部通过，才开放可配置并发。
+
+完整计划见 [docs/DEVELOPMENT_PLAN.md](docs/DEVELOPMENT_PLAN.md)。
+
+## 与上游同步
+
+本项目保留 Fork 关系：
+
+```text
+origin   → kongfihy/index-tts-enhanced
+upstream → index-tts/index-tts
 ```
 
-3. When an emotional reference audio file is specified, you can optionally set
-   the `emo_alpha` to adjust how much it affects the output.
-   Valid range is `0.0 - 1.0`, and the default value is `1.0` (100%):
+同步上游前应先检查改动范围并在独立分支验证，不应直接覆盖增强功能或已经完成的 MPS 修复。
 
-```python
-from indextts.infer_v2 import IndexTTS2
-tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, use_cuda_kernel=False)
-text = "酒楼丧尽天良，开始借机竞拍房间，哎，一群蠢货。"
-tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, output_path="gen.wav", emo_audio_prompt="examples/emo_sad.wav", emo_alpha=0.9, verbose=True)
+```bash
+git fetch upstream
 ```
 
-4. It's also possible to omit the emotional reference audio and instead provide
-   an 8-float list specifying the intensity of each emotion, in the following order:
-   `[happy, angry, sad, afraid, disgusted, melancholic, surprised, calm]`.
-   You can additionally use the `use_random` parameter to introduce stochasticity
-   during inference; the default is `False`, and setting it to `True` enables
-   randomness:
+## Codex 辅助开发说明
 
-```python
-from indextts.infer_v2 import IndexTTS2
-tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, use_cuda_kernel=False)
-text = "哇塞！这个爆率也太高了！欧皇附体了！"
-tts.infer(spk_audio_prompt='examples/voice_10.wav', text=text, output_path="gen.wav", emo_vector=[0, 0, 0, 0, 0, 0, 0.45, 0], use_random=False, verbose=True)
-```
+本项目的部分需求整理、架构分析、代码修改、测试设计、浏览器回归和文档工作，由 **OpenAI Codex** 在项目维护者的明确指令、审核和本地权限边界下辅助完成。
 
-5. Alternatively, you can enable `use_emo_text` to guide the emotions based on
-   your provided `text` script. Your text script will then automatically
-   be converted into emotion vectors.
-   You can introduce randomness with `use_random` (default: `False`;
-   `True` enables randomness):
+Codex 是开发辅助工具，不是本项目的维护者或发布者。功能取舍、试听判断、测试素材、许可证遵守、部署与最终发布决定均由项目维护者负责。
 
-```python
-from indextts.infer_v2 import IndexTTS2
-tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, use_cuda_kernel=False)
-text = "快躲起来！是他要来了！他要来抓我们了！"
-tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.wav", use_emo_text=True, use_random=False, verbose=True)
-```
+该说明仅用于透明披露开发方式，不表示 OpenAI、Codex、IndexTTS、IndexTeam 或 bilibili 对本项目提供认可、担保或联合发布。
 
-6. It's also possible to directly provide a specific text emotion description
-   via the `emo_text` parameter. Your emotion text will then automatically be
-   converted into emotion vectors. This gives you separate control of the text
-   script and the text emotion description:
+## 上游项目与论文
 
-```python
-from indextts.infer_v2 import IndexTTS2
-tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, use_cuda_kernel=False)
-text = "快躲起来！是他要来了！他要来抓我们了！"
-emo_text = "你吓死我了！你是鬼吗？"
-tts.infer(spk_audio_prompt='examples/voice_12.wav', text=text, output_path="gen.wav", use_emo_text=True, emo_text=emo_text, use_random=False, verbose=True)
-```
+- 上游代码：[index-tts/index-tts](https://github.com/index-tts/index-tts)
+- IndexTTS2 模型：[IndexTeam/IndexTTS-2](https://huggingface.co/IndexTeam/IndexTTS-2)
+- IndexTTS2 论文：[arXiv:2506.21619](https://arxiv.org/abs/2506.21619)
+- 上游演示：[IndexTTS2 Demo](https://index-tts.github.io/index-tts2.github.io/)
 
+如果问题只与原始模型、权重或官方实现有关，请优先查阅上游文档；如果问题与任务中心、多候选、音频交付、macOS 菜单栏或本增强工作流有关，请在本仓库反馈。
 
-### Legacy: IndexTTS1 User Guide
+## 许可证
 
-You can also use our previous IndexTTS1 model by importing a different module:
+本仓库保留原项目的 `LICENSE` 和版权信息。模型、原始代码以及本项目的衍生修改均受仓库内许可证约束。
 
-```python
-from indextts.infer import IndexTTS
-tts = IndexTTS(model_dir="checkpoints",cfg_path="checkpoints/config.yaml")
-voice = "examples/voice_07.wav"
-text = "大家好，我现在正在bilibili 体验 ai 科技，说实话，来之前我绝对想不到！AI技术已经发展到这样匪夷所思的地步了！比如说，现在正在说话的其实是B站为我现场复刻的数字分身，简直就是平行宇宙的另一个我了。如果大家也想体验更多深入的AIGC功能，可以访问 bilibili studio，相信我，你们也会吃惊的。"
-tts.infer(voice, text, 'gen.wav')
-```
-
-For more detailed information, see [README_INDEXTTS_1_5](archive/README_INDEXTTS_1_5.md),
-or visit the IndexTTS1 repository at <a href="https://github.com/index-tts/index-tts/tree/v1.5.0">index-tts:v1.5.0</a>.
-
-
-## Our Releases and Demos
-
-### IndexTTS2: [[Paper]](https://arxiv.org/abs/2506.21619); [[Demo]](https://index-tts.github.io/index-tts2.github.io/); [[HuggingFace]](https://huggingface.co/spaces/IndexTeam/IndexTTS-2-Demo)
-
-### IndexTTS1: [[Paper]](https://arxiv.org/abs/2502.05512); [[Demo]](https://index-tts.github.io/); [[ModelScope]](https://modelscope.cn/studios/IndexTeam/IndexTTS-Demo); [[HuggingFace]](https://huggingface.co/spaces/IndexTeam/IndexTTS)
-
-
-## Acknowledgements
-
-1. [tortoise-tts](https://github.com/neonbjb/tortoise-tts)
-2. [XTTSv2](https://github.com/coqui-ai/TTS)
-3. [BigVGAN](https://github.com/NVIDIA/BigVGAN)
-4. [wenet](https://github.com/wenet-e2e/wenet/tree/main)
-5. [icefall](https://github.com/k2-fsa/icefall)
-6. [maskgct](https://github.com/open-mmlab/Amphion/tree/main/models/tts/maskgct)
-7. [seed-vc](https://github.com/Plachtaa/seed-vc)
-
-
-## 📚 Citation
-
-🌟 If you find our work helpful, please leave us a star and cite our paper.
-
-
-IndexTTS2:
-
-```
-@article{zhou2025indextts2,
-  title={IndexTTS2: A Breakthrough in Emotionally Expressive and Duration-Controlled Auto-Regressive Zero-Shot Text-to-Speech},
-  author={Siyi Zhou, Yiquan Zhou, Yi He, Xun Zhou, Jinchao Wang, Wei Deng, Jingchen Shu},
-  journal={arXiv preprint arXiv:2506.21619},
-  year={2025}
-}
-```
-
-
-IndexTTS:
-
-```
-@article{deng2025indextts,
-  title={IndexTTS: An Industrial-Level Controllable and Efficient Zero-Shot Text-To-Speech System},
-  author={Wei Deng, Siyi Zhou, Jingchen Shu, Jinchao Wang, Lu Wang},
-  journal={arXiv preprint arXiv:2502.05512},
-  year={2025},
-  doi={10.48550/arXiv.2502.05512},
-  url={https://arxiv.org/abs/2502.05512}
-}
-```
+使用、修改、分发或提供下游版本前，请完整阅读 [LICENSE](LICENSE)，并自行确认具体使用场景是否满足其中关于衍生作品、下游接收者、商业规模、内容合规和权利保护的要求。
