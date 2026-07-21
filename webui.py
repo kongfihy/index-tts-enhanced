@@ -1045,7 +1045,7 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
             choices=list(GENERATION_STYLE_CHOICES),
             value=GENERATION_STYLE_BALANCED,
             label="生成风格预设",
-            info="“自然度优先”会填入单束搜索和更自由的采样参数；之后仍可手动调整，不做音频滤镜，可随时切回默认",
+            info="“表现力增强”会增加语气和节奏变化，也可能让连接词、数字或型号被额外强调；默认平衡模式通常更自然稳定，应用预设后仍可手动调整参数",
         )
         with gr.Row(equal_height=False):
             with gr.Column(scale=1, min_width=340):

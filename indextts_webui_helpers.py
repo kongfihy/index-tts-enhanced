@@ -15,8 +15,8 @@ def normalize_generation_text(text: str | None) -> str:
 
 
 GENERATION_STYLE_BALANCED = "平衡（默认）"
-GENERATION_STYLE_NATURAL = "自然度优先（实验）"
-GENERATION_STYLE_CHOICES = (GENERATION_STYLE_BALANCED, GENERATION_STYLE_NATURAL)
+GENERATION_STYLE_EXPRESSIVE = "表现力增强（实验）"
+GENERATION_STYLE_CHOICES = (GENERATION_STYLE_BALANCED, GENERATION_STYLE_EXPRESSIVE)
 
 
 def generation_style_values(style: str) -> tuple[float, int, float, int]:
@@ -24,7 +24,7 @@ def generation_style_values(style: str) -> tuple[float, int, float, int]:
 
     if style == GENERATION_STYLE_BALANCED:
         return 0.8, 30, 0.8, 3
-    if style == GENERATION_STYLE_NATURAL:
+    if style == GENERATION_STYLE_EXPRESSIVE:
         return 0.9, 50, 0.95, 1
     raise ValueError("无法识别生成风格，请重新选择")
 

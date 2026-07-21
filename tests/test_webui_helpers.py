@@ -7,7 +7,7 @@ import soundfile as sf
 
 from indextts_webui_helpers import (
     GENERATION_STYLE_BALANCED,
-    GENERATION_STYLE_NATURAL,
+    GENERATION_STYLE_EXPRESSIVE,
     generation_readiness,
     generation_request_key,
     generation_style_values,
@@ -92,13 +92,13 @@ class WebUIHelperTests(unittest.TestCase):
                 str(audio_path),
             )
 
-    def test_generation_style_presets_keep_default_and_offer_natural_experiment(self):
+    def test_generation_style_presets_keep_default_and_offer_expressive_experiment(self):
         self.assertEqual(
             generation_style_values(GENERATION_STYLE_BALANCED),
             (0.8, 30, 0.8, 3),
         )
         self.assertEqual(
-            generation_style_values(GENERATION_STYLE_NATURAL),
+            generation_style_values(GENERATION_STYLE_EXPRESSIVE),
             (0.9, 50, 0.95, 1),
         )
         with self.assertRaisesRegex(ValueError, "无法识别生成风格"):
