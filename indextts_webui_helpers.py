@@ -14,6 +14,27 @@ def normalize_generation_text(text: str | None) -> str:
     return (text or "").strip()
 
 
+def matched_output_details(
+    output_path: str | Path,
+    candidate_number: int,
+    match_reference_format: bool,
+) -> tuple[Path, str, str]:
+    """Return the path, UI label and manifest variant for the A/B copy."""
+
+    source = Path(output_path)
+    if match_reference_format:
+        return (
+            source.with_name(source.stem + "-delivery-matched.wav"),
+            f"候选 {candidate_number} · 匹配交付版",
+            "level_and_format_matched",
+        )
+    return (
+        source.with_name(source.stem + "-level-matched.wav"),
+        f"候选 {candidate_number} · 安全响度匹配",
+        "level_matched",
+    )
+
+
 def normalize_choice_index(value, choices) -> int:
     nested_value = getattr(value, "value", value)
     if isinstance(nested_value, int) and not isinstance(nested_value, bool):
@@ -101,10 +122,12 @@ def validate_generation_inputs(prompt_audio: str | Path | None, text: str | None
 def normalize_advanced_generation_args(values) -> list[bool | float | int]:
     values = list(values)
     if len(values) == 8:
-        # Backward compatibility for task snapshots created before the safe
-        # output-level option was added.
+        # Snapshots from before A/B output matching existed.
+        values.extend([False, False])
+    elif len(values) == 9:
+        # Snapshots with loudness A/B but before delivery-format matching.
         values.append(False)
-    if len(values) != 9:
+    if len(values) != 10:
         raise ValueError("高级生成参数不完整，请刷新页面后重试")
 
     (
@@ -117,8 +140,12 @@ def normalize_advanced_generation_args(values) -> list[bool | float | int]:
         repetition_penalty,
         max_mel_tokens,
         create_loudness_match,
+        match_reference_format,
     ) = values
-    if not isinstance(do_sample, bool) or not isinstance(create_loudness_match, bool):
+    if not all(
+        isinstance(value, bool)
+        for value in (do_sample, create_loudness_match, match_reference_format)
+    ):
         raise ValueError("生成开关状态异常，请刷新页面后重试")
 
     normalized = [
@@ -131,6 +158,7 @@ def normalize_advanced_generation_args(values) -> list[bool | float | int]:
         float(repetition_penalty),
         int(max_mel_tokens),
         create_loudness_match,
+        match_reference_format,
     ]
     (
         _,
@@ -141,6 +169,7 @@ def normalize_advanced_generation_args(values) -> list[bool | float | int]:
         clean_num_beams,
         clean_repetition_penalty,
         clean_max_mel_tokens,
+        _,
         _,
     ) = normalized
     if not 0.0 <= clean_top_p <= 1.0:

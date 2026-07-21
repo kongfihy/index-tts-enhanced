@@ -85,6 +85,7 @@ from indextts_task_center import (
 from indextts_webui_helpers import (
     generation_readiness,
     generation_request_key,
+    matched_output_details,
     normalize_advanced_generation_args,
     normalize_choice_index,
     prepare_reference_audio_file,
@@ -158,7 +159,8 @@ def register_job(project_name, text, prompt,
             "request_key": generation_request_key(request_snapshot),
             "seed": candidate_plan.base_seed,
             "candidate_count": candidate_plan.count,
-            "loudness_ab": bool(clean_advanced_args[-1]),
+            "loudness_ab": bool(clean_advanced_args[-2]),
+            "reference_format_match": bool(clean_advanced_args[-1]),
         },
         seed=candidate_plan.base_seed,
     )
@@ -297,7 +299,7 @@ def gen_single(job_id, request_snapshot, progress=gr.Progress()):
 
         do_sample, top_p, top_k, temperature, \
             length_penalty, num_beams, repetition_penalty, max_mel_tokens, \
-            create_loudness_match = advanced_args
+            create_loudness_match, match_reference_format = advanced_args
         kwargs = {
             "do_sample": bool(do_sample),
             "top_p": float(top_p),
@@ -366,18 +368,22 @@ def gen_single(job_id, request_snapshot, progress=gr.Progress()):
             generated_variants.append("dry")
 
             if create_loudness_match:
-                matched_path = output_path.with_name(output_path.stem + "-level-matched.wav")
+                matched_path, matched_label, matched_variant = matched_output_details(
+                    output_path,
+                    candidate_number,
+                    match_reference_format,
+                )
                 matched_output, match_stats = write_loudness_matched_copy(
                     dry_output,
                     prompt,
                     matched_path,
+                    match_reference_format=match_reference_format,
                 )
-                matched_label = f"候选 {candidate_number} · 安全响度匹配"
                 generated_results.append({"path": matched_output, "label": matched_label})
                 generated_paths.append(matched_output)
                 generated_seeds.append(seed)
                 generated_labels.append(matched_label)
-                generated_variants.append("level_matched")
+                generated_variants.append(matched_variant)
                 match_summaries.append(f"候选 {candidate_number}：{match_stats.summary()}")
 
         write_candidate_manifest(
@@ -391,8 +397,9 @@ def gen_single(job_id, request_snapshot, progress=gr.Progress()):
         job_manager.complete_job(job_id, generated_paths)
         seed_text = "、".join(str(seed) for seed in candidate_seeds)
         if match_summaries:
+            matched_version_name = "匹配交付版" if match_reference_format else "安全响度匹配版"
             status = (
-                f"生成完成 · {candidate_plan.count} 个候选，每个保留原始干声和安全响度匹配版 · "
+                f"生成完成 · {candidate_plan.count} 个候选，每个保留原始干声和{matched_version_name} · "
                 f"随机种子 {seed_text}\n\n" + "\n\n".join(match_summaries)
             )
         else:
@@ -1046,6 +1053,11 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
                     value=True,
                     info="保留原始干声，并按参考音频有效人声响度做一次线性匹配；最多提高 6 dB 或降低 12 dB，峰值保护约 -1 dBFS",
                 )
+                match_reference_format = gr.Checkbox(
+                    label="匹配参考音频采样率和单/双声道",
+                    value=True,
+                    info="只处理 A/B 的第二份交付版；使用高质量重采样并匹配单/双声道，不会凭空增加模型高频细节",
+                )
                 with gr.Row():
                     seed_value = gr.Number(
                         label="随机种子",
@@ -1097,6 +1109,7 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
         repetition_penalty,
         max_mel_tokens,
         create_loudness_match,
+        match_reference_format,
     ]
 
     clear_button.add([

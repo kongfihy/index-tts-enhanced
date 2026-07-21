@@ -8,6 +8,7 @@ import soundfile as sf
 from indextts_webui_helpers import (
     generation_readiness,
     generation_request_key,
+    matched_output_details,
     normalize_advanced_generation_args,
     normalize_choice_index,
     normalize_generation_text,
@@ -88,24 +89,44 @@ class WebUIHelperTests(unittest.TestCase):
                 str(audio_path),
             )
 
+    def test_matched_output_details_distinguish_delivery_and_level_only_copies(self):
+        source = Path("/tmp/candidate-01-seed-7.wav")
+        delivery_path, delivery_label, delivery_variant = matched_output_details(
+            source, 1, True
+        )
+        self.assertEqual(delivery_path.name, "candidate-01-seed-7-delivery-matched.wav")
+        self.assertEqual(delivery_label, "候选 1 · 匹配交付版")
+        self.assertEqual(delivery_variant, "level_and_format_matched")
+
+        level_path, level_label, level_variant = matched_output_details(source, 1, False)
+        self.assertEqual(level_path.name, "candidate-01-seed-7-level-matched.wav")
+        self.assertEqual(level_label, "候选 1 · 安全响度匹配")
+        self.assertEqual(level_variant, "level_matched")
+
     def test_advanced_args_are_normalized_and_old_snapshots_are_supported(self):
         self.assertEqual(
             normalize_advanced_generation_args(
-                [True, 0.8, 30.0, 0.8, 0.0, 3.0, 10.0, 1500.0, False]
+                [True, 0.8, 30.0, 0.8, 0.0, 3.0, 10.0, 1500.0, True, True]
             ),
-            [True, 0.8, 30, 0.8, 0.0, 3, 10.0, 1500, False],
+            [True, 0.8, 30, 0.8, 0.0, 3, 10.0, 1500, True, True],
+        )
+        self.assertEqual(
+            normalize_advanced_generation_args(
+                [True, 0.8, 30.0, 0.8, 0.0, 3.0, 10.0, 1500.0, True]
+            )[-2:],
+            [True, False],
         )
         self.assertEqual(
             normalize_advanced_generation_args(
                 [True, 0.8, 30.0, 0.8, 0.0, 3.0, 10.0, 1500.0]
-            )[-1],
-            False,
+            )[-2:],
+            [False, False],
         )
         with self.assertRaisesRegex(ValueError, "不完整"):
             normalize_advanced_generation_args([True])
         with self.assertRaisesRegex(ValueError, "0 到 1"):
             normalize_advanced_generation_args(
-                [True, 1.2, 30, 0.8, 0.0, 3, 10.0, 1500, True]
+                [True, 1.2, 30, 0.8, 0.0, 3, 10.0, 1500, True, True]
             )
 
     def test_validation_returns_clean_text(self):

@@ -110,6 +110,64 @@ class LoudnessMatcherTests(unittest.TestCase):
             self.assertGreater(stats.output_active_rms_dbfs, stats.input_active_rms_dbfs)
             self.assertIn("峰值", stats.summary())
 
+    def test_write_copy_can_match_reference_sample_rate_and_stereo_layout(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "dry-22k-mono.wav"
+            reference = root / "reference-44k-stereo.wav"
+            destination = root / "delivery-44k-stereo.wav"
+            source_audio = tone(0.08, sample_rate=22050)
+            reference_mono = tone(0.20, seconds=3.0, sample_rate=44100)
+            reference_stereo = np.column_stack([reference_mono, reference_mono])
+            sf.write(source, source_audio, 22050, subtype="PCM_16")
+            sf.write(reference, reference_stereo, 44100, subtype="PCM_16")
+
+            output, stats = write_loudness_matched_copy(
+                source,
+                reference,
+                destination,
+                match_reference_format=True,
+            )
+
+            converted, sample_rate = sf.read(output, dtype="float32", always_2d=True)
+            self.assertEqual(sample_rate, 44100)
+            self.assertEqual(converted.shape[1], 2)
+            self.assertAlmostEqual(
+                len(converted) / sample_rate,
+                len(source_audio) / 22050,
+                places=3,
+            )
+            np.testing.assert_allclose(converted[:, 0], converted[:, 1], atol=1 / 32767)
+            self.assertTrue(stats.format_matched)
+            self.assertEqual(stats.input_sample_rate, 22050)
+            self.assertEqual(stats.output_sample_rate, 44100)
+            self.assertEqual(stats.input_channels, 1)
+            self.assertEqual(stats.output_channels, 2)
+            self.assertIn("22.1→44.1 kHz", stats.summary())
+
+    def test_resampling_keeps_final_peak_below_ceiling(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "bright-dry.wav"
+            reference = root / "reference.wav"
+            destination = root / "delivery.wav"
+            source_audio = tone(0.89, sample_rate=22050)
+            reference_audio = tone(0.95, seconds=3.0, sample_rate=48000)
+            sf.write(source, source_audio, 22050, subtype="PCM_16")
+            sf.write(reference, reference_audio, 48000, subtype="PCM_16")
+
+            output, stats = write_loudness_matched_copy(
+                source,
+                reference,
+                destination,
+                match_reference_format=True,
+            )
+
+            converted, sample_rate = sf.read(output, dtype="float32", always_2d=True)
+            self.assertEqual(sample_rate, 48000)
+            self.assertLessEqual(float(np.max(np.abs(converted))), 10 ** (-1 / 20) + 1 / 32767)
+            self.assertLessEqual(stats.output_peak_dbfs, -0.999)
+
 
 if __name__ == "__main__":
     unittest.main()
