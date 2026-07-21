@@ -116,7 +116,8 @@ class JobManager:
                     error TEXT,
                     seed TEXT,
                     parameters_json TEXT NOT NULL DEFAULT '{}',
-                    cancel_requested INTEGER NOT NULL DEFAULT 0
+                    cancel_requested INTEGER NOT NULL DEFAULT 0,
+                    selected_output_index INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -126,6 +127,8 @@ class JobManager:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
             if "outputs_json" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN outputs_json TEXT NOT NULL DEFAULT '[]'")
+            if "selected_output_index" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN selected_output_index INTEGER")
 
     def _recover_interrupted_jobs(self):
         recovered_at = utc_now()
@@ -203,6 +206,7 @@ class JobManager:
         allowed = {
             "status", "progress", "stage", "message", "started_at", "finished_at",
             "output_path", "outputs_json", "error", "cancel_requested",
+            "selected_output_index",
         }
         values = {key: value for key, value in fields.items() if key in allowed}
         if not values:
@@ -416,7 +420,7 @@ class JobManager:
             "updated_at": utc_now(),
         }
 
-    def _manifest_output_paths(self, job_id: str) -> list[str]:
+    def _manifest_candidates(self, job_id: str) -> list[dict]:
         manifest = self.output_root / job_id / "candidates.json"
         try:
             payload = json.loads(manifest.read_text(encoding="utf-8"))
@@ -425,7 +429,10 @@ class JobManager:
         candidates = payload.get("candidates")
         if not isinstance(candidates, list):
             return []
-        return [str(item.get("path")) for item in candidates if isinstance(item, dict) and item.get("path")]
+        return [item for item in candidates if isinstance(item, dict) and item.get("path")]
+
+    def _manifest_output_paths(self, job_id: str) -> list[str]:
+        return [str(item["path"]) for item in self._manifest_candidates(job_id)]
 
     def output_paths_for_job(self, job) -> list[str]:
         if not job:
@@ -463,15 +470,54 @@ class JobManager:
 
     def output_entries(self, job) -> list[dict]:
         entries = []
+        manifest_candidates = self._manifest_candidates(str(job.get("job_id") or ""))
+        selected_index = int(job.get("selected_output_index") or 0)
         for index, raw_path in enumerate(self.output_paths_for_job(job), start=1):
             resolved = self.resolve_output_path(raw_path)
-            entries.append({
+            metadata = next(
+                (
+                    item for item in manifest_candidates
+                    if str(item.get("path")) == str(raw_path)
+                ),
+                {},
+            )
+            entry = {
                 "index": index,
                 "name": resolved.name if resolved else Path(raw_path).name or f"候选-{index}.wav",
+                "label": str(metadata.get("label") or f"生成结果 {index}"),
                 "available": bool(resolved and resolved.is_file()),
+                "selected": index == selected_index,
                 "download_url": f"/api/jobs/{job['job_id']}/outputs/{index}/download",
-            })
+            }
+            if metadata.get("seed") is not None:
+                entry["seed"] = metadata["seed"]
+            if metadata.get("variant"):
+                entry["variant"] = str(metadata["variant"])
+            entries.append(entry)
         return entries
+
+    def select_output(self, job_id: str, output_index: int) -> bool:
+        job = self.get_job(job_id)
+        if not job:
+            raise LookupError("任务记录不存在")
+        if job.get("status") != "completed":
+            raise ValueError("任务尚未生成完成")
+        try:
+            clean_index = int(output_index)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("生成结果编号无效") from exc
+        paths = self.output_paths_for_job(job)
+        if clean_index < 1 or clean_index > len(paths):
+            raise ValueError("生成结果不存在")
+        resolved = self.resolve_output_path(paths[clean_index - 1])
+        if not resolved or not resolved.is_file():
+            raise ValueError("生成结果文件不可用")
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE jobs SET selected_output_index=? WHERE job_id=? AND status='completed'",
+                (clean_index, job_id),
+            )
+        return cursor.rowcount == 1
 
     def download_path(self, job_id: str, output_index: int) -> Path | None:
         job = self.get_job(job_id)
@@ -489,6 +535,8 @@ class JobManager:
         public["outputs"] = self.output_entries(job)
         public["output_count"] = len(public["outputs"])
         public["download_all_url"] = f"/api/jobs/{job['job_id']}/download-all" if public["outputs"] else None
+        selected = next((item for item in public["outputs"] if item["selected"]), None)
+        public["selected_output"] = selected
         if job.get("error"):
             public["error_message"] = "生成失败，请在运行服务的电脑上查看日志"
         return public
@@ -498,6 +546,10 @@ class JobManager:
         data = dict(row)
         data["progress"] = round(float(data.get("progress") or 0), 4)
         data["cancel_requested"] = bool(data.get("cancel_requested"))
+        selected_output_index = data.get("selected_output_index")
+        data["selected_output_index"] = (
+            int(selected_output_index) if selected_output_index is not None else None
+        )
         try:
             data["parameters"] = json.loads(data.pop("parameters_json") or "{}")
         except json.JSONDecodeError:
@@ -576,7 +628,8 @@ let canManage=false,openProjects=new Set(),initialized=false;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const timeText=s=>{if(!s)return '-';let d=new Date(s);return isNaN(d)?esc(s):d.toLocaleString('zh-CN',{hour12:false})};
 async function cancelJob(id){if(!canManage||!confirm('确定取消这个任务吗？'))return;await fetch(`/api/jobs/${id}/cancel`,{method:'POST'});refresh()}
-function outputButtons(x){if(!x.outputs?.length)return x.status==='completed'?'<span class="sub">未找到输出文件</span>':'';let items=x.outputs.map(o=>`<a class="download ${o.available?'':'unavailable'}" href="${o.available?o.download_url:'#'}">下载结果 ${o.index}</a>`);if(x.outputs.filter(o=>o.available).length>1)items.push(`<a class="download" href="${x.download_all_url}">打包下载全部</a>`);return items.join('')}
+async function selectOutput(jobId,index){if(!canManage)return;let response=await fetch(`/api/jobs/${jobId}/outputs/${index}/select`,{method:'POST'}),payload=await response.json();if(!response.ok){alert(payload.error||'无法保存最佳版本');return}refresh()}
+function outputButtons(x){if(!x.outputs?.length)return x.status==='completed'?'<span class="sub">未找到输出文件</span>':'';let items=x.outputs.map(o=>{let label=esc(o.label||`生成结果 ${o.index}`),seed=o.seed!==undefined?` · 种子 ${esc(o.seed)}`:'';return `<div class="outputChoice ${o.selected?'selected':''}"><span class="outputLabel">${o.selected?'★ ':''}${label}${seed}</span><a class="download ${o.available?'':'unavailable'}" href="${o.available?o.download_url:'#'}">下载</a><button class="pick manageOnly ${o.selected?'chosen':''}" ${o.available?'':'disabled'} onclick="selectOutput('${x.job_id}',${o.index})">${o.selected?'已选最佳':'设为最佳'}</button></div>`});if(x.outputs.filter(o=>o.available).length>1)items.push(`<a class="download" href="${x.download_all_url}">打包下载全部</a>`);return items.join('')}
 function renderVersion(x){let pc=Math.round((x.progress||0)*100),active=!['completed','failed','cancelled'].includes(x.status),candidateCount=x.parameters?.candidate_count||1,resultCount=x.output_count||candidateCount;return `<article class="version"><div class="versionTop"><div><span class="versionTitle">版本 ${x.project_version}</span> <span class="badge ${x.status}">${names[x.status]||esc(x.status)}</span></div><span class="sub">${timeText(x.created_at)}</span></div><div class="summary">${esc(x.input_summary||x.job_type)}</div><div class="meta"><span>${esc(stages[x.stage]||x.message||'')}</span>${x.seed!==null&&x.seed!==undefined?`<span>种子 ${esc(x.seed)}</span>`:''}<span>${candidateCount} 个候选</span><span>${resultCount} 个结果</span><span>${pc}%</span></div>${active?`<div class="progress" style="margin-top:10px"><div class="bar" style="width:${pc}%"></div></div>`:''}<div class="actions">${outputButtons(x)}${active?`<button class="cancel manageOnly" onclick="cancelJob('${x.job_id}')">取消任务</button>`:''}</div></article>`}
 function renderProjects(jobs){let groups=new Map();for(let x of jobs){if(!groups.has(x.project_id))groups.set(x.project_id,{name:x.project_name,jobs:[]});groups.get(x.project_id).jobs.push(x)}let root=document.querySelector('#projectsList');if(!groups.size){root.innerHTML='<div class="panel empty sub">没有符合筛选条件的任务</div>';return}if(!initialized){openProjects.add(groups.keys().next().value);initialized=true}root.innerHTML=[...groups].map(([id,g])=>`<details class="projectGroup" data-id="${esc(id)}" ${openProjects.has(id)?'open':''}><summary><div class="projectHeader"><div class="projectTitle"><h2>${esc(g.name)}</h2><div class="sub">最近更新 ${timeText(g.jobs[0].created_at)}</div></div><span class="count">${g.jobs.length} 个版本</span></div></summary><div class="versions">${g.jobs.map(renderVersion).join('')}</div></details>`).join('');root.querySelectorAll('details').forEach(d=>d.addEventListener('toggle',()=>d.open?openProjects.add(d.dataset.id):openProjects.delete(d.dataset.id)))}
 async function refresh(){try{let status=document.querySelector('#status').value,project=document.querySelector('#project').value,q=new URLSearchParams({limit:'5000'});if(status)q.set('status',status);if(project)q.set('project_id',project);let [sr,jr,pr]=await Promise.all([fetch('/api/status'),fetch('/api/jobs?'+q),fetch('/api/projects')]);let s=await sr.json(),j=await jr.json(),p=await pr.json();canManage=!!s.can_manage;document.body.classList.toggle('canManage',canManage);document.querySelector('#access').textContent=canManage?'本机管理模式':'局域网只读 · 可查看和下载';document.querySelector('#active').textContent=s.active_jobs;document.querySelector('#queued').textContent=s.queued_jobs;document.querySelector('#failed').textContent=s.failed_jobs;document.querySelector('#projectCount').textContent=p.projects.length;document.querySelector('#updated').textContent='刚刚更新';let ps=document.querySelector('#project'),old=ps.value;ps.innerHTML='<option value="">全部项目</option>'+p.projects.map(x=>`<option value="${esc(x.project_id)}">${esc(x.project_name)} (${x.job_count})</option>`).join('');ps.value=old;let c=document.querySelector('#current');if(s.current_job){let x=s.current_job,pc=Math.round(x.progress*100);c.className='panel current show';c.innerHTML=`<div class="currentTop"><div><h3>${esc(x.project_name)} · 版本 ${x.project_version}</h3><div class="sub">${esc(stages[x.stage]||x.message||'生成中')} · ${pc}%</div></div><button class="cancel manageOnly" onclick="cancelJob('${x.job_id}')">取消当前任务</button></div><div class="wideProgress"><div class="bar" style="width:${pc}%"></div></div>`}else{c.className='panel current';c.innerHTML=''}renderProjects(j.jobs)}catch(e){document.querySelector('#updated').textContent='连接失败'}}
@@ -714,6 +767,21 @@ class TaskCenterHandler(BaseHTTPRequestHandler):
                 return
             ok = self.manager.request_cancel(parts[2])
             self._json({"ok": ok}, 200 if ok else 409)
+            return
+        if len(parts) == 6 and parts[:2] == ["api", "jobs"] and parts[3] == "outputs" and parts[5] == "select":
+            if not self._can_manage():
+                self._json({"error": "局域网访问为只读模式"}, 403)
+                return
+            try:
+                output_index = int(parts[4])
+                ok = self.manager.select_output(parts[2], output_index)
+            except LookupError as exc:
+                self._json({"error": str(exc)}, 404)
+                return
+            except ValueError as exc:
+                self._json({"error": str(exc)}, 409)
+                return
+            self._json({"ok": ok, "selected_output_index": output_index}, 200 if ok else 409)
             return
         self._json({"error": "not found"}, 404)
 

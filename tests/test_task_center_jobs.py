@@ -263,6 +263,48 @@ class JobManagerQueueTests(unittest.TestCase):
         self.assertTrue(all(item["available"] for item in public["outputs"]))
         self.assertNotIn(str(self.root), json.dumps(public, ensure_ascii=False))
 
+    def test_completed_output_can_be_marked_as_preferred_and_keeps_manifest_label(self):
+        manager = self.make_manager(dedupe_window_seconds=0)
+        job_id = self.create_job(manager)
+        manager.start_job(job_id)
+        paths = [self.output_root / job_id / f"candidate-{index:02d}.wav" for index in (1, 2)]
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"wav")
+        (self.output_root / job_id / "candidates.json").write_text(json.dumps({
+            "candidates": [
+                {"path": str(paths[0]), "label": "候选 1 · 原始干声", "seed": 20, "variant": "dry"},
+                {"path": str(paths[1]), "label": "候选 2 · 原始干声", "seed": 21, "variant": "dry"},
+            ],
+        }))
+        manager.complete_job(job_id, paths)
+
+        self.assertTrue(manager.select_output(job_id, 2))
+        job = manager.get_job(job_id)
+        public = manager.public_job(job)
+
+        self.assertEqual(job["selected_output_index"], 2)
+        self.assertFalse(public["outputs"][0]["selected"])
+        self.assertTrue(public["outputs"][1]["selected"])
+        self.assertEqual(public["outputs"][1]["label"], "候选 2 · 原始干声")
+        self.assertEqual(public["outputs"][1]["seed"], 21)
+        self.assertEqual(public["selected_output"]["index"], 2)
+
+    def test_preferred_output_must_exist_and_be_available(self):
+        manager = self.make_manager(dedupe_window_seconds=0)
+        job_id = self.create_job(manager)
+        manager.start_job(job_id)
+        path = self.output_root / job_id / "candidate-01.wav"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"wav")
+        manager.complete_job(job_id, [path])
+
+        with self.assertRaisesRegex(ValueError, "生成结果不存在"):
+            manager.select_output(job_id, 2)
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, "生成结果文件不可用"):
+            manager.select_output(job_id, 1)
+
     def test_output_download_rejects_paths_outside_task_root(self):
         manager = self.make_manager(dedupe_window_seconds=0)
         outside = self.root / "private.wav"
@@ -276,7 +318,7 @@ class JobManagerQueueTests(unittest.TestCase):
         self.assertFalse(public["outputs"][0]["available"])
         self.assertIsNone(manager.download_path(job_id, 1))
 
-    def test_existing_database_is_migrated_with_outputs_json(self):
+    def test_existing_database_is_migrated_with_output_columns(self):
         legacy_db = self.root / "legacy.sqlite3"
         with sqlite3.connect(legacy_db) as conn:
             conn.execute("""CREATE TABLE jobs (
@@ -290,6 +332,7 @@ class JobManagerQueueTests(unittest.TestCase):
         with manager._connect() as conn:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
         self.assertIn("outputs_json", columns)
+        self.assertIn("selected_output_index", columns)
 
     def test_lan_access_is_read_only_but_loopback_can_manage(self):
         self.assertTrue(is_management_client("127.0.0.1", "127.0.0.1"))
@@ -307,7 +350,8 @@ class JobManagerQueueTests(unittest.TestCase):
     def test_task_center_page_contains_grouped_versions_and_downloads(self):
         self.assertIn("projectGroup", ADMIN_HTML)
         self.assertIn("版本 ${x.project_version}", ADMIN_HTML)
-        self.assertIn("下载结果 ${o.index}", ADMIN_HTML)
+        self.assertIn("设为最佳", ADMIN_HTML)
+        self.assertIn("selectOutput", ADMIN_HTML)
         self.assertIn("${resultCount} 个结果", ADMIN_HTML)
         self.assertIn("打包下载全部", ADMIN_HTML)
         self.assertIn("局域网只读", ADMIN_HTML)

@@ -49,6 +49,12 @@ class TaskCenterHTTPTests(unittest.TestCase):
         paths = [job_dir / "candidate-01.wav", job_dir / "candidate-02.wav"]
         paths[0].write_bytes(b"RIFF-first")
         paths[1].write_bytes(b"RIFF-second")
+        (job_dir / "candidates.json").write_text(json.dumps({
+            "candidates": [
+                {"path": str(paths[0]), "label": "候选 1 · 原始干声", "seed": 10},
+                {"path": str(paths[1]), "label": "候选 2 · 原始干声", "seed": 11},
+            ],
+        }))
         self.manager.complete_job(job_id, paths)
         return job_id, paths
 
@@ -69,6 +75,10 @@ class TaskCenterHTTPTests(unittest.TestCase):
         self.assertEqual(job["output_count"], 2)
         self.assertEqual(len(job["outputs"]), 2)
         self.assertTrue(all(output["available"] for output in job["outputs"]))
+        self.assertEqual([output["label"] for output in job["outputs"]], [
+            "候选 1 · 原始干声",
+            "候选 2 · 原始干声",
+        ])
         serialized = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn(str(self.output_root), serialized)
         self.assertNotIn("output_path", serialized)
@@ -87,6 +97,25 @@ class TaskCenterHTTPTests(unittest.TestCase):
         self.assertEqual(body, paths[1].read_bytes())
         self.assertIn("candidate-02.wav", disposition)
         self.assertEqual(response.headers.get_content_type(), "audio/x-wav")
+
+    def test_loopback_client_can_mark_and_change_preferred_output(self):
+        job_id, _ = self.create_completed_job()
+
+        for index in (2, 1):
+            request = urllib.request.Request(
+                f"{self.base_url}/api/jobs/{job_id}/outputs/{index}/select",
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=3) as response:
+                payload = json.loads(response.read())
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["selected_output_index"], index)
+
+        _, job = self.get_json(f"/api/jobs/{job_id}")
+        self.assertEqual(job["selected_output_index"], 1)
+        self.assertTrue(job["outputs"][0]["selected"])
+        self.assertFalse(job["outputs"][1]["selected"])
+        self.assertEqual(job["selected_output"]["index"], 1)
 
     def test_download_all_returns_zip_with_every_candidate(self):
         job_id, paths = self.create_completed_job()
@@ -151,6 +180,16 @@ class TaskCenterHTTPTests(unittest.TestCase):
                 urllib.request.urlopen(request, timeout=3)
             self.assertEqual(context.exception.code, 403)
             self.assertEqual(self.manager.get_job(job_id)["status"], "queued")
+
+            completed_job_id, _ = self.create_completed_job()
+            select_request = urllib.request.Request(
+                f"{base_url}/api/jobs/{completed_job_id}/outputs/1/select",
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as select_context:
+                urllib.request.urlopen(select_request, timeout=3)
+            self.assertEqual(select_context.exception.code, 403)
+            self.assertIsNone(self.manager.get_job(completed_job_id)["selected_output_index"])
         finally:
             server.shutdown()
             server.server_close()
