@@ -14,6 +14,21 @@ def normalize_generation_text(text: str | None) -> str:
     return (text or "").strip()
 
 
+GENERATION_STYLE_BALANCED = "平衡（默认）"
+GENERATION_STYLE_NATURAL = "自然度优先（实验）"
+GENERATION_STYLE_CHOICES = (GENERATION_STYLE_BALANCED, GENERATION_STYLE_NATURAL)
+
+
+def generation_style_values(style: str) -> tuple[float, int, float, int]:
+    """Map a UI generation-style preset to top-p, top-k, temperature and beams."""
+
+    if style == GENERATION_STYLE_BALANCED:
+        return 0.8, 30, 0.8, 3
+    if style == GENERATION_STYLE_NATURAL:
+        return 0.9, 50, 0.95, 1
+    raise ValueError("无法识别生成风格，请重新选择")
+
+
 def matched_output_details(
     output_path: str | Path,
     candidate_number: int,

@@ -83,8 +83,11 @@ from indextts_task_center import (
     task_center_host_for_webui,
 )
 from indextts_webui_helpers import (
+    GENERATION_STYLE_BALANCED,
+    GENERATION_STYLE_CHOICES,
     generation_readiness,
     generation_request_key,
+    generation_style_values,
     matched_output_details,
     normalize_advanced_generation_args,
     normalize_choice_index,
@@ -171,6 +174,18 @@ def register_job(project_name, text, prompt,
         gr.update(interactive=False),
         "任务已加入队列，开始后可以在任务中心查看进度。",
         True,
+    )
+
+
+def apply_generation_style(style):
+    top_p_value, top_k_value, temperature_value, num_beams_value = (
+        generation_style_values(style)
+    )
+    return (
+        gr.update(value=top_p_value),
+        gr.update(value=top_k_value),
+        gr.update(value=temperature_value),
+        gr.update(value=num_beams_value),
     )
 
 
@@ -1026,6 +1041,12 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
 
     with gr.Accordion(i18n("高级生成参数设置"), open=False):
         gr.Markdown("不熟悉这些参数时建议保持默认值。", elem_classes="section-note")
+        generation_style = gr.Radio(
+            choices=list(GENERATION_STYLE_CHOICES),
+            value=GENERATION_STYLE_BALANCED,
+            label="生成风格预设",
+            info="“自然度优先”会填入单束搜索和更自由的采样参数；之后仍可手动调整，不做音频滤镜，可随时切回默认",
+        )
         with gr.Row(equal_height=False):
             with gr.Column(scale=1, min_width=340):
                 gr.Markdown("#### 采样参数")
@@ -1111,6 +1132,13 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
         create_loudness_match,
         match_reference_format,
     ]
+
+    generation_style.change(
+        fn=apply_generation_style,
+        inputs=[generation_style],
+        outputs=[top_p, top_k, temperature, num_beams],
+        show_progress="hidden",
+    )
 
     clear_button.add([
         prompt_audio,

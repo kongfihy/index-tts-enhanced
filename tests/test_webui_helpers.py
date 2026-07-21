@@ -6,8 +6,11 @@ import numpy as np
 import soundfile as sf
 
 from indextts_webui_helpers import (
+    GENERATION_STYLE_BALANCED,
+    GENERATION_STYLE_NATURAL,
     generation_readiness,
     generation_request_key,
+    generation_style_values,
     matched_output_details,
     normalize_advanced_generation_args,
     normalize_choice_index,
@@ -88,6 +91,18 @@ class WebUIHelperTests(unittest.TestCase):
                 validate_audio_file(audio_path, "情感参考音频"),
                 str(audio_path),
             )
+
+    def test_generation_style_presets_keep_default_and_offer_natural_experiment(self):
+        self.assertEqual(
+            generation_style_values(GENERATION_STYLE_BALANCED),
+            (0.8, 30, 0.8, 3),
+        )
+        self.assertEqual(
+            generation_style_values(GENERATION_STYLE_NATURAL),
+            (0.9, 50, 0.95, 1),
+        )
+        with self.assertRaisesRegex(ValueError, "无法识别生成风格"):
+            generation_style_values("未知模式")
 
     def test_matched_output_details_distinguish_delivery_and_level_only_copies(self):
         source = Path("/tmp/candidate-01-seed-7.wav")
