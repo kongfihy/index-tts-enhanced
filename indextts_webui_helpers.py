@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from indextts_dubbing.audio.reference_analyzer import (
@@ -48,6 +49,71 @@ def matched_output_details(
         f"候选 {candidate_number} · 安全响度匹配",
         "level_matched",
     )
+
+
+def group_candidate_outputs(
+    results,
+    selected_output_index: int | None = None,
+    *,
+    max_candidates: int = 3,
+) -> list[dict]:
+    """Group manifest outputs into stable candidate cards for the WebUI."""
+
+    try:
+        selected_index = int(selected_output_index or 0)
+    except (TypeError, ValueError):
+        selected_index = 0
+
+    grouped: dict[int, dict] = {}
+    fallback_candidate = 0
+    for fallback_output_index, raw_result in enumerate(results or [], start=1):
+        if isinstance(raw_result, dict):
+            path = raw_result.get("path")
+            try:
+                output_index = int(raw_result.get("index") or fallback_output_index)
+            except (TypeError, ValueError):
+                output_index = fallback_output_index
+            if output_index <= 0:
+                output_index = fallback_output_index
+            label = str(raw_result.get("label") or f"生成结果 {output_index}")
+            seed = raw_result.get("seed")
+            variant = str(raw_result.get("variant") or "") or None
+        else:
+            path = raw_result
+            output_index = fallback_output_index
+            label = f"生成结果 {output_index}"
+            seed = None
+            variant = None
+        if not path:
+            continue
+
+        match = re.search(r"候选\s*(\d+)", label)
+        if match:
+            candidate_number = int(match.group(1))
+        else:
+            fallback_candidate += 1
+            candidate_number = fallback_candidate
+        if not 1 <= candidate_number <= max_candidates:
+            continue
+
+        card = grouped.setdefault(
+            candidate_number,
+            {"candidate_number": candidate_number, "seed": seed, "outputs": []},
+        )
+        if card.get("seed") is None and seed is not None:
+            card["seed"] = seed
+        card["outputs"].append(
+            {
+                "index": output_index,
+                "path": str(path),
+                "label": label,
+                "seed": seed,
+                "variant": variant,
+                "selected": output_index == selected_index,
+            }
+        )
+
+    return [grouped[number] for number in sorted(grouped)]
 
 
 def normalize_choice_index(value, choices) -> int:

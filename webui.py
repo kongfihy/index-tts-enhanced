@@ -88,6 +88,7 @@ from indextts_webui_helpers import (
     generation_readiness,
     generation_request_key,
     generation_style_values,
+    group_candidate_outputs,
     matched_output_details,
     normalize_advanced_generation_args,
     normalize_choice_index,
@@ -116,11 +117,11 @@ EMO_CHOICES = [i18n("与音色参考音频相同"),
 os.makedirs("outputs/tasks",exist_ok=True)
 os.makedirs("prompts",exist_ok=True)
 
-def register_job(project_name, text, prompt,
+def register_job(candidate_count, project_name, text, prompt,
                  emo_control_method, emo_ref_path, emo_weight,
                  vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                  emo_text, emo_random, max_text_tokens_per_segment,
-                 seed_value, candidate_count, *advanced_args):
+                 seed_value, *advanced_args):
     try:
         clean_text = validate_generation_inputs(prompt, text)
         emotion_method = normalize_choice_index(emo_control_method, EMO_CHOICES)
@@ -171,6 +172,7 @@ def register_job(project_name, text, prompt,
         job_id,
         request_snapshot,
         gr.update(interactive=False, value="正在排队…"),
+        gr.update(interactive=False, value="正在排队…"),
         gr.update(interactive=False),
         "任务已加入队列，开始后可以在任务中心查看进度。",
         True,
@@ -191,17 +193,22 @@ def apply_generation_style(style):
 
 def update_submit_state(prompt, text, is_busy=False):
     if is_busy:
-        return gr.update(interactive=False, value="正在生成…"), "当前任务正在生成，可以继续编辑文本准备下一次提交。"
+        return (
+            gr.update(interactive=False, value="正在生成…"),
+            gr.update(interactive=False, value="正在生成…"),
+            "当前任务正在生成，可以继续编辑文本准备下一次提交。",
+        )
     ready, message = generation_readiness(prompt, text)
-    return gr.update(
-        interactive=ready,
-        value="开始生成" if ready else "请完善输入",
-    ), message
+    return (
+        gr.update(interactive=ready, value="快速生成 1 个"),
+        gr.update(interactive=ready, value="生成 3 个候选"),
+        message,
+    )
 
 
 def update_reference_state(prompt, text, is_busy=False):
-    submit_update, readiness = update_submit_state(prompt, text, is_busy)
-    return submit_update, readiness, reference_audio_quality_message(prompt)
+    quick_update, three_update, readiness = update_submit_state(prompt, text, is_busy)
+    return quick_update, three_update, readiness, reference_audio_quality_message(prompt)
 
 
 def prepare_prompt_audio(prompt):
@@ -215,24 +222,23 @@ def prepare_prompt_audio(prompt):
 def restore_action_buttons(prompt, text):
     ready, _ = generation_readiness(prompt, text)
     return (
-        gr.update(interactive=ready, value="开始生成" if ready else "请完善输入"),
+        gr.update(interactive=ready, value="快速生成 1 个"),
+        gr.update(interactive=ready, value="生成 3 个候选"),
         gr.update(interactive=True),
         False,
     )
 
 
 def reset_ui_state():
+    empty_view = candidate_view_updates([])
     return (
-        gr.update(interactive=False, value="请完善输入"),
+        gr.update(interactive=False, value="快速生成 1 个"),
+        gr.update(interactive=False, value="生成 3 个候选"),
         "请先上传参考音频，并填写需要生成的文本。",
         "等待生成",
+        "生成后可以在这里试听候选并标记最佳版本。",
         "输入文本后会在这里预览模型分段。",
-        gr.update(value=None, visible=False),
-        gr.update(value=None, visible=False),
-        gr.update(value=None, visible=False),
-        gr.update(value=None, visible=False),
-        gr.update(value=None, visible=False),
-        gr.update(value=None, visible=False),
+        *empty_view,
         False,
         "上传后会自动检查时长、音量、削波和静音比例。",
     )
@@ -242,34 +248,100 @@ def mark_generation_failed():
     return "生成未完成，请根据页面提示检查输入；任务详情可在任务中心查看。"
 
 
-def candidate_result_updates(results):
-    clean_results = []
-    for index, result in enumerate(results or [], start=1):
-        if isinstance(result, dict):
-            path = result.get("path")
-            label = result.get("label") or f"生成结果 {index}"
+def candidate_view_updates(results, selected_output_index=None):
+    cards = group_candidate_outputs(results, selected_output_index)
+    cards_by_number = {card["candidate_number"]: card for card in cards}
+    audio_updates = []
+    card_updates = []
+    metadata_updates = []
+    button_updates = []
+    output_indexes = []
+
+    for candidate_number in range(1, 4):
+        card = cards_by_number.get(candidate_number)
+        card_updates.append(gr.update(visible=bool(card)))
+        if card:
+            seed = card.get("seed")
+            seed_text = f" · Seed {seed}" if seed is not None else ""
+            metadata_updates.append(f"**候选 {candidate_number}**{seed_text}")
+            outputs = list(card.get("outputs") or [])[:2]
         else:
-            path = result
-            label = f"生成结果 {index}"
-        if path:
-            clean_results.append((str(path), str(label)))
-    padded = (clean_results + [(None, "生成结果")] * 6)[:6]
-    return tuple(
-        gr.update(value=path, label=label, visible=bool(path))
-        for path, label in padded
+            metadata_updates.append("")
+            outputs = []
+
+        for slot in range(2):
+            item = outputs[slot] if slot < len(outputs) else None
+            if item:
+                selected = bool(item.get("selected"))
+                audio_updates.append(gr.update(
+                    value=item["path"], label=item["label"], visible=True
+                ))
+                button_updates.append(gr.update(
+                    visible=True,
+                    interactive=not selected,
+                    value="✓ 当前最佳" if selected else "设为最佳",
+                    variant="primary" if selected else "secondary",
+                ))
+                output_indexes.append(int(item["index"]))
+            else:
+                audio_updates.append(gr.update(value=None, visible=False))
+                button_updates.append(gr.update(visible=False, interactive=False, value="设为最佳"))
+                output_indexes.append(0)
+
+    return (
+        *audio_updates,
+        *card_updates,
+        *metadata_updates,
+        *button_updates,
+        *output_indexes,
     )
+
+
+def selection_note_for_job(job_id):
+    job = job_manager.get_job(job_id) if job_id else None
+    try:
+        selected = int((job or {}).get("selected_output_index") or 0)
+    except (TypeError, ValueError):
+        selected = 0
+    if selected:
+        outputs = job_manager.output_entries(job)
+        item = next((output for output in outputs if output["index"] == selected), None)
+        if item:
+            return f"已选择最佳版本：**{item['label']}**"
+    return "尚未选择最佳版本。试听后可以随时更改。"
+
+
+def select_candidate_output(job_id, output_index):
+    try:
+        selected = int(output_index or 0)
+    except (TypeError, ValueError):
+        selected = 0
+    if not job_id or selected <= 0:
+        raise gr.Error("当前生成结果不可用，请重新生成或前往任务中心查看")
+    try:
+        job_manager.select_output(job_id, selected)
+    except (LookupError, ValueError) as exc:
+        raise gr.Error(str(exc))
+    results = read_candidate_manifest(Path("outputs/tasks"), job_id)
+    view = candidate_view_updates(results, selected)
+    return (*view[12:18], selection_note_for_job(job_id))
 
 
 def gen_single(job_id, request_snapshot, progress=gr.Progress()):
     output_root = Path("outputs/tasks")
+    unchanged_view = tuple(gr.update() for _ in range(24))
     try:
         should_run, existing_output = job_manager.start_job(job_id)
     except JobCancelled:
         gr.Warning(i18n("任务已取消"))
-        return *(gr.update() for _ in range(6)), "任务已取消"
+        return (*unchanged_view, "任务已取消", gr.update())
     except JobAlreadyRunning as exc:
         gr.Warning(str(exc))
-        return *(gr.update() for _ in range(6)), "相同任务已经在生成，请在任务中心查看进度。"
+        return (
+            *unchanged_view,
+            "相同任务已经在生成，请在任务中心查看进度。",
+            gr.update(),
+        )
     except RuntimeError as exc:
         raise gr.Error(str(exc))
 
@@ -277,9 +349,12 @@ def gen_single(job_id, request_snapshot, progress=gr.Progress()):
         restored = read_candidate_manifest(output_root, job_id)
         if not restored and existing_output:
             restored = [{"path": existing_output, "label": "已完成结果"}]
+        job = job_manager.get_job(job_id) or {}
+        selected_output_index = job.get("selected_output_index")
         return (
-            *candidate_result_updates(restored),
+            *candidate_view_updates(restored, selected_output_index),
             f"检测到相同任务已经完成，已恢复 {len(restored) or 1} 个生成结果。",
+            selection_note_for_job(job_id),
         )
 
     candidate_root = candidate_directory(output_root, job_id)
@@ -419,7 +494,11 @@ def gen_single(job_id, request_snapshot, progress=gr.Progress()):
             )
         else:
             status = f"生成完成 · {candidate_plan.count} 个原始干声候选 · 随机种子 {seed_text}"
-        return (*candidate_result_updates(generated_results), status)
+        return (
+            *candidate_view_updates(generated_results),
+            status,
+            selection_note_for_job(job_id),
+        )
     except Exception as exc:
         job_manager.fail_job(job_id, exc)
         shutil.rmtree(candidate_root, ignore_errors=True)
@@ -684,7 +763,8 @@ html::-webkit-scrollbar-thumb {
     background: var(--idx-surface-soft) !important;
     color: var(--idx-text) !important;
 }
-#generate-button button {
+#generate-button button,
+#generate-three-button button {
     min-height: 46px;
     font-weight: 700;
     transition: transform 120ms ease-out, box-shadow 120ms ease-out;
@@ -703,11 +783,26 @@ html::-webkit-scrollbar-thumb {
 #generate-button button:active:not(:disabled) {
     transform: scale(0.985);
 }
+#generate-three-button button:active:not(:disabled) {
+    transform: scale(0.985);
+}
+#generate-three-button button:not(:disabled) {
+    border-color: color-mix(in srgb, var(--idx-accent) 48%, var(--idx-border));
+    color: var(--idx-accent);
+}
+#generate-three-button button:disabled,
+#generate-three-button button[disabled] {
+    color: var(--idx-text-muted) !important;
+    opacity: 0.78 !important;
+}
 #clear-button button {
     min-height: 46px;
 }
 .action-row {
     align-items: end;
+}
+.candidate-action-note {
+    margin-top: 8px;
 }
 .output-card {
     position: sticky;
@@ -759,6 +854,46 @@ html::-webkit-scrollbar-thumb {
 }
 .result-panel audio {
     width: 100%;
+}
+.candidate-card {
+    margin-top: 12px;
+    padding: 12px !important;
+    border: 1px solid var(--idx-border) !important;
+    border-radius: 14px !important;
+    background: var(--idx-surface-soft) !important;
+    box-shadow: none !important;
+}
+.candidate-card > .styler,
+.candidate-output > .styler {
+    background: transparent !important;
+}
+.candidate-meta {
+    min-height: 24px;
+    color: var(--idx-text);
+}
+.candidate-meta p {
+    margin: 0 !important;
+}
+.candidate-output {
+    margin-top: 8px;
+    padding: 0 !important;
+    border: 0 !important;
+    background: transparent !important;
+}
+.select-output-button button {
+    min-height: 34px;
+    margin-top: 4px;
+    font-size: 12px;
+    transition: transform 120ms ease-out;
+}
+.select-output-button button:active:not(:disabled) {
+    transform: scale(0.985);
+}
+.selection-note {
+    min-height: 24px;
+    margin-top: 8px;
+    color: var(--idx-text-muted);
+    font-size: 13px;
 }
 .output-card > .styler {
     background: transparent !important;
@@ -915,13 +1050,25 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
                     elem_id="clear-button",
                 )
                 gen_button = gr.Button(
-                    "请完善输入",
+                    "快速生成 1 个",
                     key="gen_button",
                     interactive=False,
                     variant="primary",
                     size="lg",
                     elem_id="generate-button",
                 )
+                gen_three_button = gr.Button(
+                    "生成 3 个候选",
+                    key="gen_three_button",
+                    interactive=False,
+                    variant="secondary",
+                    size="lg",
+                    elem_id="generate-three-button",
+                )
+            gr.Markdown(
+                "快速生成适合直接出稿；3 个候选会使用连续随机种子依次生成，耗时约为单候选的 3 倍。",
+                elem_classes=["section-note", "candidate-action-note"],
+            )
 
         with gr.Column(scale=1, min_width=0, elem_classes=["output-card", "result-panel"]):
             gr.HTML(
@@ -936,57 +1083,42 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
                 "等待生成",
                 elem_classes=["status-copy", "generation-status"],
             )
-            with gr.Row():
-                output_audio = gr.Audio(
-                    label="候选 1 · 原始干声",
-                    visible=False,
-                    key="output_audio",
-                    editable=False,
-                    interactive=False,
-                    show_download_button=True,
-                )
-                output_audio_2 = gr.Audio(
-                    label="候选 1 · 安全响度匹配",
-                    visible=False,
-                    key="output_audio_2",
-                    editable=False,
-                    interactive=False,
-                    show_download_button=True,
-                )
-            with gr.Row():
-                output_audio_3 = gr.Audio(
-                    label="候选 2 · 原始干声",
-                    visible=False,
-                    key="output_audio_3",
-                    editable=False,
-                    interactive=False,
-                    show_download_button=True,
-                )
-                output_audio_4 = gr.Audio(
-                    label="候选 2 · 安全响度匹配",
-                    visible=False,
-                    key="output_audio_4",
-                    editable=False,
-                    interactive=False,
-                    show_download_button=True,
-                )
-            with gr.Row():
-                output_audio_5 = gr.Audio(
-                    label="候选 3 · 原始干声",
-                    visible=False,
-                    key="output_audio_5",
-                    editable=False,
-                    interactive=False,
-                    show_download_button=True,
-                )
-                output_audio_6 = gr.Audio(
-                    label="候选 3 · 安全响度匹配",
-                    visible=False,
-                    key="output_audio_6",
-                    editable=False,
-                    interactive=False,
-                    show_download_button=True,
-                )
+            selection_note = gr.Markdown(
+                "生成后可以在这里试听候选并标记最佳版本。",
+                elem_classes="selection-note",
+            )
+            candidate_cards = []
+            candidate_metadata = []
+            output_audios = []
+            select_buttons = []
+            output_index_states = []
+            for candidate_number in range(1, 4):
+                with gr.Group(visible=False, elem_classes="candidate-card") as candidate_card:
+                    candidate_meta = gr.Markdown("", elem_classes="candidate-meta")
+                    for output_slot in range(2):
+                        output_number = (candidate_number - 1) * 2 + output_slot + 1
+                        with gr.Group(elem_classes="candidate-output"):
+                            output_audio = gr.Audio(
+                                label=f"候选 {candidate_number} · 生成结果",
+                                visible=False,
+                                key=f"output_audio_{output_number}",
+                                editable=False,
+                                interactive=False,
+                                show_download_button=True,
+                            )
+                            select_button = gr.Button(
+                                "设为最佳",
+                                visible=False,
+                                interactive=False,
+                                variant="secondary",
+                                size="sm",
+                                elem_classes="select-output-button",
+                            )
+                        output_audios.append(output_audio)
+                        select_buttons.append(select_button)
+                        output_index_states.append(gr.State(0))
+                candidate_cards.append(candidate_card)
+                candidate_metadata.append(candidate_meta)
 
     with gr.Accordion("声音与情感", open=False):
         gr.Markdown("默认沿用音色参考音频的情感；只有需要精细控制时再展开设置。", elem_classes="section-note")
@@ -1079,21 +1211,12 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
                     value=True,
                     info="只处理 A/B 的第二份交付版；使用高质量重采样并匹配单/双声道，不会凭空增加模型高频细节",
                 )
-                with gr.Row():
-                    seed_value = gr.Number(
-                        label="随机种子",
-                        value=0,
-                        precision=0,
-                        info="相同种子可复现；填写 -1 会自动生成新种子",
-                    )
-                    candidate_count = gr.Slider(
-                        label="候选数量",
-                        minimum=1,
-                        maximum=3,
-                        value=1,
-                        step=1,
-                        info="增加候选更容易选到自然版本，也会相应增加生成时间",
-                    )
+                seed_value = gr.Number(
+                    label="随机种子",
+                    value=0,
+                    precision=0,
+                    info="相同种子可复现；填写 -1 会自动生成新种子",
+                )
 
             with gr.Column(scale=1, min_width=340):
                 gr.Markdown("#### 分句设置")
@@ -1132,6 +1255,13 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
         create_loudness_match,
         match_reference_format,
     ]
+    candidate_view_components = [
+        *output_audios,
+        *candidate_cards,
+        *candidate_metadata,
+        *select_buttons,
+        *output_index_states,
+    ]
 
     generation_style.change(
         fn=apply_generation_style,
@@ -1148,21 +1278,20 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
         segments_preview,
     ])
     busy_state = gr.State(False)
+    single_candidate_count = gr.State(1)
+    three_candidate_count = gr.State(3)
 
     clear_button.click(
         reset_ui_state,
         inputs=None,
         outputs=[
             gen_button,
+            gen_three_button,
             readiness_note,
             generation_status,
+            selection_note,
             segment_note,
-            output_audio,
-            output_audio_2,
-            output_audio_3,
-            output_audio_4,
-            output_audio_5,
-            output_audio_6,
+            *candidate_view_components,
             busy_state,
             reference_quality_note,
         ],
@@ -1173,7 +1302,7 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
     prompt_audio.change(
         update_reference_state,
         inputs=[prompt_audio, input_text_single, busy_state],
-        outputs=[gen_button, readiness_note, reference_quality_note],
+        outputs=[gen_button, gen_three_button, readiness_note, reference_quality_note],
         queue=False,
         trigger_mode="always_last",
         show_progress="hidden",
@@ -1188,7 +1317,7 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
     input_text_single.input(
         update_submit_state,
         inputs=[prompt_audio, input_text_single, busy_state],
-        outputs=[gen_button, readiness_note],
+        outputs=[gen_button, gen_three_button, readiness_note],
         queue=False,
         trigger_mode="always_last",
         show_progress="hidden",
@@ -1220,76 +1349,90 @@ with gr.Blocks(title="IndexTTS 中文语音生成", css=APP_CSS) as demo:
     job_id_state = gr.State("")
     generation_request_state = gr.State({})
     clear_button.add([job_id_state, generation_request_state])
-    register_event = gen_button.click(
-        register_job,
-        inputs=[
-            project_name,
-            input_text_single,
-            prompt_audio,
-            emo_control_method,
-            emo_upload,
-            emo_weight,
-            vec1,
-            vec2,
-            vec3,
-            vec4,
-            vec5,
-            vec6,
-            vec7,
-            vec8,
-            emo_text,
-            emo_random,
-            max_text_tokens_per_segment,
-            seed_value,
-            candidate_count,
-            *advanced_params,
-        ],
-        outputs=[
-            job_id_state,
-            generation_request_state,
-            gen_button,
-            clear_button,
-            generation_status,
-            busy_state,
-        ],
-        queue=False,
-        trigger_mode="once",
-        show_progress="hidden",
-    )
-    generation_event = register_event.success(
-        gen_single,
-        inputs=[job_id_state, generation_request_state],
-        outputs=[
-            output_audio,
-            output_audio_2,
-            output_audio_3,
-            output_audio_4,
-            output_audio_5,
-            output_audio_6,
-            generation_status,
-        ],
-        concurrency_limit=1,
-        concurrency_id="tts-generation",
-        trigger_mode="once",
-        show_progress="full",
-        # Bind progress to the always-visible status surface. The audio player is
-        # hidden before the first result, so targeting it can hide the overlay.
-        show_progress_on=[generation_status],
-    )
-    generation_event.failure(
-        mark_generation_failed,
-        inputs=None,
-        outputs=[generation_status],
-        queue=False,
-        show_progress="hidden",
-    )
-    generation_event.then(
-        restore_action_buttons,
-        inputs=[prompt_audio, input_text_single],
-        outputs=[gen_button, clear_button, busy_state],
-        queue=False,
-        show_progress="hidden",
-    )
+
+    registration_inputs = [
+        project_name,
+        input_text_single,
+        prompt_audio,
+        emo_control_method,
+        emo_upload,
+        emo_weight,
+        vec1,
+        vec2,
+        vec3,
+        vec4,
+        vec5,
+        vec6,
+        vec7,
+        vec8,
+        emo_text,
+        emo_random,
+        max_text_tokens_per_segment,
+        seed_value,
+        *advanced_params,
+    ]
+    registration_outputs = [
+        job_id_state,
+        generation_request_state,
+        gen_button,
+        gen_three_button,
+        clear_button,
+        generation_status,
+        busy_state,
+    ]
+    generation_outputs = [
+        *candidate_view_components,
+        generation_status,
+        selection_note,
+    ]
+
+    def wire_generation_button(button, candidate_count_state):
+        register_event = button.click(
+            register_job,
+            inputs=[candidate_count_state, *registration_inputs],
+            outputs=registration_outputs,
+            queue=False,
+            trigger_mode="once",
+            show_progress="hidden",
+        )
+        generation_event = register_event.success(
+            gen_single,
+            inputs=[job_id_state, generation_request_state],
+            outputs=generation_outputs,
+            concurrency_limit=1,
+            concurrency_id="tts-generation",
+            trigger_mode="once",
+            show_progress="full",
+            # Bind progress to the always-visible status surface. The audio player is
+            # hidden before the first result, so targeting it can hide the overlay.
+            show_progress_on=[generation_status],
+        )
+        generation_event.failure(
+            mark_generation_failed,
+            inputs=None,
+            outputs=[generation_status],
+            queue=False,
+            show_progress="hidden",
+        )
+        generation_event.then(
+            restore_action_buttons,
+            inputs=[prompt_audio, input_text_single],
+            outputs=[gen_button, gen_three_button, clear_button, busy_state],
+            queue=False,
+            show_progress="hidden",
+        )
+
+    wire_generation_button(gen_button, single_candidate_count)
+    wire_generation_button(gen_three_button, three_candidate_count)
+
+    for select_index, select_button in enumerate(select_buttons):
+        select_button.click(
+            select_candidate_output,
+            inputs=[job_id_state, output_index_states[select_index]],
+            outputs=[*select_buttons, selection_note],
+            queue=False,
+            show_progress="hidden",
+        )
 
 
 if __name__ == "__main__":

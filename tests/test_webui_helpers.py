@@ -11,6 +11,7 @@ from indextts_webui_helpers import (
     generation_readiness,
     generation_request_key,
     generation_style_values,
+    group_candidate_outputs,
     matched_output_details,
     normalize_advanced_generation_args,
     normalize_choice_index,
@@ -103,6 +104,53 @@ class WebUIHelperTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "无法识别生成风格"):
             generation_style_values("未知模式")
+
+    def test_candidate_outputs_are_grouped_with_persisted_selection(self):
+        cards = group_candidate_outputs(
+            [
+                {"path": "/tmp/c1-dry.wav", "label": "候选 1 · 原始干声", "seed": 20, "variant": "dry"},
+                {"path": "/tmp/c1-match.wav", "label": "候选 1 · 匹配交付版", "seed": 20, "variant": "level_and_format_matched"},
+                {"path": "/tmp/c2-dry.wav", "label": "候选 2 · 原始干声", "seed": 21, "variant": "dry"},
+            ],
+            selected_output_index=2,
+        )
+        self.assertEqual([card["candidate_number"] for card in cards], [1, 2])
+        self.assertEqual(cards[0]["seed"], 20)
+        self.assertEqual([item["index"] for item in cards[0]["outputs"]], [1, 2])
+        self.assertFalse(cards[0]["outputs"][0]["selected"])
+        self.assertTrue(cards[0]["outputs"][1]["selected"])
+
+    def test_candidate_outputs_support_single_variant_cards(self):
+        cards = group_candidate_outputs(
+            [
+                {"path": "/tmp/c1.wav", "label": "候选 1 · 原始干声", "seed": 7},
+                {"path": "/tmp/c2.wav", "label": "候选 2 · 原始干声", "seed": 8},
+            ]
+        )
+        self.assertEqual(len(cards), 2)
+        self.assertEqual([len(card["outputs"]) for card in cards], [1, 1])
+
+    def test_candidate_outputs_preserve_manifest_indexes_when_files_are_missing(self):
+        cards = group_candidate_outputs(
+            [
+                {
+                    "index": 2,
+                    "path": "/tmp/c1-match.wav",
+                    "label": "候选 1 · 匹配交付版",
+                    "seed": 20,
+                },
+                {
+                    "index": 5,
+                    "path": "/tmp/c3-dry.wav",
+                    "label": "候选 3 · 原始干声",
+                    "seed": 22,
+                },
+            ],
+            selected_output_index=5,
+        )
+        self.assertEqual(cards[0]["outputs"][0]["index"], 2)
+        self.assertEqual(cards[1]["outputs"][0]["index"], 5)
+        self.assertTrue(cards[1]["outputs"][0]["selected"])
 
     def test_matched_output_details_distinguish_delivery_and_level_only_copies(self):
         source = Path("/tmp/candidate-01-seed-7.wav")
